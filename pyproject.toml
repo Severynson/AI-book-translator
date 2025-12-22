@@ -1,0 +1,9 @@
+[project]
+name = "ai-book-translator"
+version = "0.1.0"
+description = "AI book translator with upload-first metadata + chunked fallback"
+requires-python = ">=3.10"
+dependencies = ["requests>=2.31.0", "pypdf", "reportlab"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
