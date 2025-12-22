@@ -14,13 +14,13 @@ from ..infrastructure.llm.exceptions import (
 from ..infrastructure.llm.json_parser import parse_json_strict
 from ..infrastructure.llm.exceptions import InvalidJSONError
 from .chunking import chunk_by_chars
-from .prompt_builders import (
-    build_step1_metadata_prompt,
-    build_step1_user_prompt_upload,
-    build_local_chunk_summary_system_prompt,
+from .prompts import (
+    METADATA_EXTRACTION_SYSTEM_PROMPT,
+    METADATA_UPLOAD_USER_PROMPT,
+    LOCAL_CHUNK_SUMMARY_SYSTEM_PROMPT,
     build_local_chunk_summary_user_prompt,
-    build_step1_summary_of_summaries_system_prompt,
-    build_step1_summary_of_summaries_user_prompt,
+    SUMMARY_OF_SUMMARIES_SYSTEM_PROMPT,
+    build_summary_of_summaries_user_prompt,
 )
 from .llm_json import chat_json_strict_with_repair
 
@@ -61,8 +61,8 @@ class MetadataService:
         return self._chunked_fallback(doc, target_language, reason="no file provided for upload", **kwargs)
 
     def _upload_metadata(self, file_path: str, **kwargs: Any) -> dict:
-        system = build_step1_metadata_prompt()
-        user = build_step1_user_prompt_upload()
+        system = METADATA_EXTRACTION_SYSTEM_PROMPT
+        user = METADATA_UPLOAD_USER_PROMPT
 
         raw = self.provider.chat_text_with_document(
             system_prompt=system,
@@ -92,13 +92,13 @@ class MetadataService:
         chunk_summaries: List[str] = []
         for i, ch in enumerate(chunks[: self.settings.max_chunk_summaries_for_summary_of_summaries]):
             is_early = i < self.settings.local_metadata_first_chunks_with_title_author_hint
-            sys = build_local_chunk_summary_system_prompt()
+            sys = LOCAL_CHUNK_SUMMARY_SYSTEM_PROMPT
             usr = build_local_chunk_summary_user_prompt(ch, is_early_chunk=is_early)
             s = self.provider.chat_text(system_prompt=sys, user_prompt=usr, **kwargs).strip()
             chunk_summaries.append(s)
 
-        system = build_step1_summary_of_summaries_system_prompt()
-        user = build_step1_summary_of_summaries_user_prompt(chunk_summaries)
+        system = SUMMARY_OF_SUMMARIES_SYSTEM_PROMPT
+        user = build_summary_of_summaries_user_prompt(chunk_summaries)
 
         meta = chat_json_strict_with_repair(
             provider=self.provider,

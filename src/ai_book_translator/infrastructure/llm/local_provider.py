@@ -12,6 +12,7 @@ from .exceptions import (
     TransientLLMError,
 )
 
+
 class LocalOllamaProvider(LLMProvider):
     """
     Local provider for an OpenAI-compatible Ollama server.
@@ -28,8 +29,7 @@ class LocalOllamaProvider(LLMProvider):
         _ = self.chat_text(
             system_prompt="You are a helpful assistant.",
             user_prompt="Reply with exactly: OK",
-            temperature=0,
-            max_tokens=8,
+            max_tokens=250,
         )
 
     def chat_text(self, system_prompt: str, user_prompt: str, **kwargs: Any) -> str:
@@ -69,4 +69,6 @@ class LocalOllamaProvider(LLMProvider):
         **kwargs: Any,
     ) -> str:
         # Local LLM path: no doc upload; your MetadataService will catch this and fall back to chunking.
-        raise UploadNotSupportedError("Local provider does not support document upload.")
+        raise UploadNotSupportedError(
+            "Local provider does not support document upload."
+        )

@@ -26,11 +26,17 @@ class OpenAIResponsesProvider(LLMProvider):
 
     def __init__(
         self,
-        api_key: str = os.environ["OPENAI_API_KEY"],
+        api_key: Optional[str] = None,
         model: str = "gpt-5-nano",
         base_url: str = "https://api.openai.com",
         timeout_sec: int = 60,
     ):
+        if api_key is None:
+            api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "Missing OpenAI API key. Pass api_key=... or set OPENAI_API_KEY."
+            )
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
@@ -50,8 +56,7 @@ class OpenAIResponsesProvider(LLMProvider):
         _ = self.chat_text(
             system_prompt="You are a helpful assistant.",
             user_prompt="Reply with exactly: OK",
-            temperature=0,
-            max_output_tokens=16,
+            max_output_tokens=128,
         )
 
     # ---------- Core helpers ----------
