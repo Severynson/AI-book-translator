@@ -1,10 +1,9 @@
 from __future__ import annotations
-
 import os
 from typing import Any, Dict, Optional, List, Tuple
-
 import requests
-
+import time
+import random
 from .base import LLMProvider
 from .exceptions import (
     LLMError,
@@ -29,7 +28,7 @@ class OpenAIResponsesProvider(LLMProvider):
         api_key: Optional[str] = None,
         model: str = "gpt-5-nano",
         base_url: str = "https://api.openai.com",
-        timeout_sec: int = 60,
+        timeout_sec: int = 400,
     ):
         if api_key is None:
             api_key = os.getenv("OPENAI_API_KEY")
@@ -56,30 +55,53 @@ class OpenAIResponsesProvider(LLMProvider):
         _ = self.chat_text(
             system_prompt="You are a helpful assistant.",
             user_prompt="Reply with exactly: OK",
-            max_output_tokens=128,
+            max_output_tokens=512,
         )
 
     # ---------- Core helpers ----------
 
     def _post_json(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        try:
-            r = requests.post(
-                url,
-                headers=self._headers_json(),
-                json=payload,
-                timeout=self.timeout_sec,
-            )
-        except requests.Timeout as e:
-            raise TransientLLMError(f"Timeout calling {url}") from e
-        except requests.RequestException as e:
-            raise TransientLLMError(f"Network error calling {url}: {e}") from e
+        # Try a few times on timeouts / transient codes
+        max_attempts = 4
+        base_sleep = 1.0
 
-        if r.status_code in (429, 500, 502, 503, 504):
-            raise TransientLLMError(f"Transient error {r.status_code}: {r.text[:500]}")
-        if r.status_code >= 400:
-            raise LLMError(f"HTTP {r.status_code}: {r.text[:1200]}")
+        last_err: Exception | None = None
 
-        return r.json()
+        for attempt in range(1, max_attempts + 1):
+            try:
+                r = requests.post(
+                    url,
+                    headers=self._headers_json(),
+                    json=payload,
+                    timeout=self.timeout_sec,  # consider 180–300 for big docs
+                )
+            except requests.Timeout as e:
+                last_err = e
+                # backoff
+                sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
+                time.sleep(sleep_s)
+                continue
+            except requests.RequestException as e:
+                last_err = e
+                sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
+                time.sleep(sleep_s)
+                continue
+
+            # transient http statuses
+            if r.status_code in (429, 500, 502, 503, 504):
+                last_err = TransientLLMError(
+                    f"Transient error {r.status_code}: {r.text[:500]}"
+                )
+                sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
+                time.sleep(sleep_s)
+                continue
+
+            if r.status_code >= 400:
+                raise LLMError(f"HTTP {r.status_code}: {r.text[:1200]}")
+
+            return r.json()
+
+        raise TransientLLMError(f"Timeout/Network failure calling {url}") from last_err
 
     def _extract_output_text(self, resp: Dict[str, Any]) -> str:
         """
@@ -128,6 +150,10 @@ class OpenAIResponsesProvider(LLMProvider):
         if "max_tokens" in kwargs and "max_output_tokens" not in kwargs:
             kwargs["max_output_tokens"] = kwargs.pop("max_tokens")
 
+        text = kwargs.pop("text", None)
+        if text is not None:
+            payload["text"] = text
+
         payload.update(kwargs)
 
         resp = self._post_json(url, payload)
@@ -173,6 +199,10 @@ class OpenAIResponsesProvider(LLMProvider):
         if "max_tokens" in kwargs and "max_output_tokens" not in kwargs:
             kwargs["max_output_tokens"] = kwargs.pop("max_tokens")
 
+        text = kwargs.pop("text", None)
+        if text is not None:
+            payload["text"] = text
+
         payload.update(kwargs)
 
         try:
@@ -202,6 +232,17 @@ class OpenAIResponsesProvider(LLMProvider):
                 f"Empty output_text after file input. Raw response: {resp}"
             )
         return text
+
+    def _looks_like_unsupported_schema_error(msg: str) -> bool:
+        m = msg.lower()
+        needles = [
+            "json_schema",
+            "structured outputs",
+            "response format",
+            "text.format",
+            "unsupported",
+        ]
+        return any(n in m for n in needles)
 
     # ---------- File upload ----------
 

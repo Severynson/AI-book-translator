@@ -5,16 +5,76 @@ from typing import List
 # STEP 1 — METADATA (UPLOAD / GLOBAL)
 # =========================
 
-METADATA_EXTRACTION_SYSTEM_PROMPT = (
-    "Extract book metadata and return STRICT JSON only. "
-    'If a field is not present, output the string "not provided" for that field. '
-    'Required keys: "author(s)", "title", "language", "summary", "chapters". '
-    'For "chapters": return an object where keys are chapter identifiers '
-    "and values are short summaries. "
-    "No extra keys. No markdown. No commentary."
+METADATA_SYSTEM_PROMPT = (
+    "Extract book metadata and return ONLY a single JSON object (no markdown, no extra text). "
+    "The JSON must contain EXACTLY these keys and no others: "
+    '"author(s)", "title", "language", "summary", "chapters". '
+    'If a field is not present, use the EXACT string "not provided". '
+    '"author(s)" MUST be a single string of names separated by comma+space (", "), never an array. '
+    '"chapters" MUST be a JSON object where each key is a chapter identifier string and each value is a short summary string; '
+    "if chapters cannot be inferred, output an empty object {}."
 )
 
-METADATA_UPLOAD_USER_PROMPT = "Return the metadata JSON for the uploaded document."
+METADATA_USER_PROMPT_UPLOAD = "Return the metadata JSON for the uploaded document."
+
+# Used only when schema-mode fails or returns unusable output:
+METADATA_REPAIR_PROMPT = (
+    "You MUST rewrite the content below into VALID JSON ONLY.\n"
+    "This is a DATA REPAIR task, not a summarization or explanation task.\n\n"
+    "OUTPUT REQUIREMENTS (MANDATORY):\n"
+    "1. Output MUST be a single valid JSON object.\n"
+    "2. Do NOT include any text before or after the JSON.\n"
+    "3. Do NOT include markdown, comments, explanations, or formatting.\n\n"
+    "JSON SCHEMA (YOU MUST FOLLOW EXACTLY):\n"
+    "- The JSON object MUST contain EXACTLY the following 5 keys:\n"
+    '  • "author(s)"\n'
+    '  • "title"\n'
+    '  • "language"\n'
+    '  • "summary"\n'
+    '  • "chapters"\n\n'
+    "KEY CONSTRAINTS:\n"
+    '- "author(s)":\n'
+    "  • MUST be a SINGLE STRING\n"
+    '  • MUST list author names separated by comma + space (", ")\n'
+    "  • MUST NOT be a JSON array\n"
+    '  • If authors are unknown, use the EXACT string "not provided"\n\n'
+    '- "title":\n'
+    "  • MUST be a STRING\n"
+    '  • If title is unknown, use the EXACT string "not provided"\n\n'
+    '- "language":\n'
+    "  • MUST be a STRING\n"
+    '  • If language is unknown, use the EXACT string "not provided"\n\n'
+    '- "summary":\n'
+    "  • MUST be a STRING\n"
+    "  • Must be a concise paragraph summarizing the document\n"
+    '  • If summary cannot be inferred, use the EXACT string "not provided"\n\n'
+    '- "chapters":\n'
+    "  • MUST be a JSON OBJECT (dictionary)\n"
+    "  • Each KEY must be a chapter identifier (string)\n"
+    "  • Each VALUE must be a SHORT STRING summary of that chapter\n"
+    "  • MUST NOT be an array\n"
+    "  • If chapters cannot be inferred, use an EMPTY OBJECT {}\n\n"
+    "ADDITIONAL STRICT RULES:\n"
+    "- NO additional keys are allowed (additionalProperties = false).\n"
+    '- All values MUST be strings, except "chapters" which is an object of string → string.\n'
+    "- Do NOT invent information.\n"
+    "- Do NOT omit required keys.\n"
+    "- Do NOT change the meaning of the content, only fix structure and formatting.\n\n"
+    "EXAMPLE OF A CORRECT RESPONSE (FORMAT ONLY):\n"
+    "{\n"
+    '  "author(s)": "Carl Gustav Jung",\n'
+    '  "title": "Über die Psychologie des Unbewussten",\n'
+    '  "language": "German",\n'
+    '  "summary": "This work explores the structure and dynamics of the unconscious mind, introducing foundational concepts of analytical psychology such as archetypes, the collective unconscious, and symbolic interpretation of mythological and psychological material.",\n'
+    '  "chapters": {\n'
+    '    "Chapter 1": "Introduction to the concept of the unconscious and its role in psychological life.",\n'
+    '    "Chapter 2": "Analysis of mythological symbols and their psychological significance.",\n'
+    '    "Chapter 3": "Discussion of archetypes and the collective unconscious.",\n'
+    '    "Chapter 4": "Implications of unconscious processes for individual development."\n'
+    "  }\n"
+    "}\n\n"
+    "INPUT TO REPAIR:\n"
+)
 
 # =========================
 # STEP 1 — LOCAL LLM CHUNK SUMMARIZATION
@@ -44,7 +104,10 @@ def build_local_chunk_summary_user_prompt(
 # STEP 1 — SUMMARY OF SUMMARIES (LOCAL LLM)
 # =========================
 
-SUMMARY_OF_SUMMARIES_SYSTEM_PROMPT = METADATA_EXTRACTION_SYSTEM_PROMPT
+SUMMARY_OF_SUMMARIES_SYSTEM_PROMPT = (
+    METADATA_SYSTEM_PROMPT
+    + " The input is a list of chunk summaries, not the original document."
+)
 
 
 def build_summary_of_summaries_user_prompt(

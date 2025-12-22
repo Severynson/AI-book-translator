@@ -1,26 +1,21 @@
-# src/ai_book_translator/infrastructure/llm/local_ollama_provider.py
-
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 import requests
 
 from .base import LLMProvider
-from .exceptions import (
-    LLMError,
-    UploadNotSupportedError,
-    TransientLLMError,
-)
+from .exceptions import LLMError, UploadNotSupportedError, TransientLLMError
 
 
 class LocalOllamaProvider(LLMProvider):
     """
     Local provider for an OpenAI-compatible Ollama server.
-    Expected endpoints:
+
+    Expected endpoint:
       - POST {base_url}/v1/chat/completions
     """
 
-    def __init__(self, base_url: str, model: str, timeout_sec: int = 60):
+    def __init__(self, base_url: str, model: str, timeout_sec: int = 240):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout_sec = timeout_sec
@@ -29,11 +24,12 @@ class LocalOllamaProvider(LLMProvider):
         _ = self.chat_text(
             system_prompt="You are a helpful assistant.",
             user_prompt="Reply with exactly: OK",
-            max_tokens=250,
+            max_tokens=64,
         )
 
     def chat_text(self, system_prompt: str, user_prompt: str, **kwargs: Any) -> str:
         url = f"{self.base_url}/v1/chat/completions"
+
         payload: Dict[str, Any] = {
             "model": self.model,
             "messages": [
@@ -41,6 +37,8 @@ class LocalOllamaProvider(LLMProvider):
                 {"role": "user", "content": user_prompt},
             ],
         }
+
+        # Some OpenAI-like fields may not be supported; pass through but keep safe defaults
         payload.update(kwargs)
 
         try:
@@ -62,13 +60,8 @@ class LocalOllamaProvider(LLMProvider):
             raise LLMError(f"Unexpected response shape: {data}") from e
 
     def chat_text_with_document(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-        file_path: str,
-        **kwargs: Any,
+        self, system_prompt: str, user_prompt: str, file_path: str, **kwargs: Any
     ) -> str:
-        # Local LLM path: no doc upload; your MetadataService will catch this and fall back to chunking.
         raise UploadNotSupportedError(
             "Local provider does not support document upload."
         )

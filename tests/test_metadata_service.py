@@ -56,7 +56,7 @@ def settings():
     return Settings(
         upload_retries=2,
         json_repair_retries=1,
-        translation_chunk_chars=1800,
+        translation_chunk_chars=30000,
         local_metadata_chunk_chars=20,
         local_metadata_first_chunks_with_title_author_hint=1,
         max_chunk_summaries_for_summary_of_summaries=3,
