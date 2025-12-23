@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
@@ -9,6 +11,13 @@ from ai_book_translator.domain.models import DocumentInput, MetadataResult
 from ai_book_translator.infrastructure.llm.base import LLMProvider
 from ai_book_translator.services.chunking import chunk_by_chars
 from ai_book_translator.services.llm_json import chat_json_strict_with_repair
+
+from ai_book_translator.infrastructure.persistence.translation_state import (
+    compute_document_hash,
+    make_state_path,
+    save_state,
+    delete_state,
+)
 
 
 class TranslationWorker(QThread):
@@ -24,6 +33,9 @@ class TranslationWorker(QThread):
         document: DocumentInput,
         metadata_result: MetadataResult,
         target_language: str,
+        output_txt_path: str,
+        resume_state: Optional[Dict[str, Any]] = None,
+        resume_state_path: Optional[str] = None,
     ):
         super().__init__()
         self.provider = provider
@@ -31,6 +43,9 @@ class TranslationWorker(QThread):
         self.document = document
         self.metadata_result = metadata_result
         self.target_language = target_language
+        self.output_txt_path = output_txt_path
+        self.resume_state = resume_state or None
+        self.resume_state_path = resume_state_path or None
         self._pause = False
 
     def request_pause(self) -> None:
@@ -39,6 +54,28 @@ class TranslationWorker(QThread):
     def request_resume(self) -> None:
         self._pause = False
 
+    def _write_header_if_needed(
+        self, fp, meta: Dict[str, Any], target_language: str
+    ) -> None:
+        # Only write header if file is empty.
+        try:
+            is_empty = fp.tell() == 0 and Path(self.output_txt_path).stat().st_size == 0
+        except Exception:
+            is_empty = fp.tell() == 0
+
+        if not is_empty:
+            return
+
+        lines: List[str] = []
+        lines.append(f"Title: {meta.get('title', 'not provided')}")
+        lines.append(f"Author(s): {meta.get('author(s)', 'not provided')}")
+        lines.append(f"Source language: {meta.get('language', 'not provided')}")
+        lines.append(f"Target language: {target_language}")
+        lines.append("")
+        lines.append("=" * 80)
+        lines.append("")
+        fp.write("\n".join(lines))
+
     def run(self) -> None:
         try:
             if self.document.raw_text is None:
@@ -46,9 +83,10 @@ class TranslationWorker(QThread):
                     "No raw_text available for translation. Ensure PDF/TXT extraction is implemented."
                 )
 
-            chunks = chunk_by_chars(
-                self.document.raw_text, self.settings.translation_chunk_chars
-            )
+            raw_text = self.document.raw_text
+            doc_hash = compute_document_hash(raw_text)
+
+            chunks = chunk_by_chars(raw_text, self.settings.translation_chunk_chars)
             total = max(1, len(chunks))
 
             meta = dict(self.metadata_result.metadata or {})
@@ -60,27 +98,62 @@ class TranslationWorker(QThread):
             if title and title != "not provided":
                 opt_ctx["title"] = title
 
-            current_chapter = None
+            # Resume values (if any)
+            start_index = 0
+            current_chapter: Optional[str] = None
             prev_tail = ""
-            translations: List[Dict[str, str]] = []
 
-            for i, chunk in enumerate(chunks):
-                while self._pause:
-                    self.msleep(150)
-
-                pct = int((i / total) * 100)
-                self.progressed.emit(pct, f"Translating chunk {i+1}/{total}…")
-
-                sys = (
-                    "You are a professional book translator. "
-                    'Return STRICT JSON only: {"chapter": "...", "translation": "..."}. '
-                    "No markdown. No commentary.\n\n"
-                    f"Previous translation tail (last 300 chars):\n{prev_tail}"
+            state_path: Path
+            if self.resume_state_path:
+                state_path = Path(self.resume_state_path)
+            else:
+                state_path = make_state_path(
+                    title=title if isinstance(title, str) else None, doc_hash=doc_hash
                 )
 
-                ctx_block = f"Optional context: {opt_ctx}\n" if opt_ctx else ""
+            if self.resume_state and isinstance(self.resume_state, dict):
+                # Only resume if the stored hash matches
+                if self.resume_state.get("document_hash") == doc_hash:
+                    start_index = int(
+                        self.resume_state.get("current_chunk_index", 0) or 0
+                    )
+                    current_chapter = self.resume_state.get("current_chapter") or None
+                    prev_tail = self.resume_state.get("last_translation_tail") or ""
+                # else: silently treat as fresh
 
-                usr = f"""
+            # Open output file in append mode (always incremental)
+            out_path = Path(self.output_txt_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+
+            with open(out_path, "a", encoding="utf-8") as fp:
+                self._write_header_if_needed(fp, meta, self.target_language)
+
+                # If resuming, show a message in UI
+                if start_index > 0:
+                    self.progressed.emit(
+                        int((start_index / total) * 100),
+                        f"Resuming from chunk {start_index+1}/{total}…",
+                    )
+
+                for i in range(start_index, len(chunks)):
+                    while self._pause:
+                        self.msleep(150)
+
+                    pct = int((i / total) * 100)
+                    self.progressed.emit(pct, f"Translating chunk {i+1}/{total}…")
+
+                    chunk = chunks[i]
+
+                    sys = (
+                        "You are a professional book translator. "
+                        'Return STRICT JSON only: {"chapter": "...", "translation": "..."}. '
+                        "No markdown. No commentary.\n\n"
+                        f"Previous translation tail (last 300 chars):\n{prev_tail}"
+                    )
+
+                    ctx_block = f"Optional context: {opt_ctx}\n" if opt_ctx else ""
+
+                    usr = f"""
 {ctx_block}Target language: {self.target_language}
 Current chapter (from previous chunk, may overwrite if new chapter begins): {current_chapter}
 
@@ -90,36 +163,57 @@ Chunk text:
 Output JSON only.
 """.strip()
 
-                obj = chat_json_strict_with_repair(
-                    provider=self.provider,
-                    system_prompt=sys,
-                    user_prompt=usr,
-                    repair_retries=2,
-                )
-
-                ch = obj.get("chapter")
-                tr = obj.get("translation")
-                if not isinstance(tr, str) or not tr.strip():
-                    raise RuntimeError(
-                        f"Model returned empty translation for chunk {i}."
+                    obj = chat_json_strict_with_repair(
+                        provider=self.provider,
+                        system_prompt=sys,
+                        user_prompt=usr,
+                        repair_retries=2,
                     )
 
-                if isinstance(ch, str) and ch.strip():
-                    current_chapter = ch.strip()
+                    ch = obj.get("chapter")
+                    tr = obj.get("translation")
 
-                prev_tail = tr[-300:] if len(tr) > 300 else tr
-                translations.append(
-                    {"chapter": current_chapter or "", "translation": tr}
-                )
-                self.chunk_done.emit(i, tr)
+                    if not isinstance(tr, str) or not tr.strip():
+                        raise RuntimeError(
+                            f"Model returned empty translation for chunk {i}."
+                        )
+
+                    if isinstance(ch, str) and ch.strip():
+                        current_chapter = ch.strip()
+
+                    # Append to output TXT immediately
+                    if current_chapter:
+                        fp.write(f"\n\n## {current_chapter}\n\n")
+                    fp.write(tr.strip())
+                    fp.write("\n")
+                    fp.flush()
+
+                    prev_tail = tr[-300:] if len(tr) > 300 else tr
+
+                    # Persist state after each successful chunk
+                    state_obj: Dict[str, Any] = {
+                        "document_hash": doc_hash,
+                        "output_txt_path": str(out_path),
+                        "current_chunk_index": i + 1,  # NEXT chunk to translate
+                        "chunks_total": total,
+                        "current_chapter": current_chapter or "",
+                        "last_translation_tail": prev_tail,
+                        "metadata": meta,
+                        "target_language": self.target_language,
+                        "translation_chunk_chars": int(
+                            self.settings.translation_chunk_chars
+                        ),
+                        "updated_at_unix": int(time.time()),
+                    }
+                    save_state(state_path, state_obj)
+
+                    self.chunk_done.emit(i, tr)
+
+            # Completed successfully -> delete state JSON
+            delete_state(state_path)
 
             self.progressed.emit(100, "Done")
-            self.succeeded.emit(
-                {
-                    "metadata": meta,
-                    "target_language": self.target_language,
-                    "translations": translations,
-                }
-            )
+            self.succeeded.emit({"ok": True, "output_txt_path": str(out_path)})
+
         except Exception as e:
             self.failed.emit(str(e))

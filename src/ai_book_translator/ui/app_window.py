@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional, Any, Dict
+import hashlib
 
 from PyQt5.QtWidgets import QMainWindow, QStackedWidget
 
@@ -13,6 +14,33 @@ from .pages.model_setup_page import ModelSetupPage
 from .pages.book_input_page import BookInputPage
 from .pages.metadata_page import MetadataPage
 from .pages.translate_page import TranslatePage
+
+from ai_book_translator.infrastructure.persistence.metadata_cache import (
+    find_metadata_cache_by_hash,
+    load_metadata_cache,
+)
+
+try:
+    from ai_book_translator.infrastructure.io.read_document.base import ReadDocument
+except Exception:
+    ReadDocument = None
+
+
+def _doc_hash_from_text(text: str) -> str:
+    b = (text or "").encode("utf-8", errors="ignore")
+    return hashlib.sha256(b).hexdigest()
+
+
+# ---- Translation resume (adapt imports to your actual module) ----
+try:
+    # If you already implemented state resume, adapt names here.
+    from ai_book_translator.infrastructure.persistence.state_store import (
+        find_translation_state_by_hash,
+        load_translation_state,
+    )
+except Exception:
+    find_translation_state_by_hash = None
+    load_translation_state = None
 
 
 @dataclass
@@ -86,7 +114,70 @@ class AppWindow(QMainWindow):
         self._go_book_input()
 
     def _on_document_ready(self, doc: DocumentInput) -> None:
+        """
+        New behavior:
+        - Ensure raw_text exists if possible (needed for hashing + local fallbacks)
+        - Compute document_hash from FULL TEXT
+        - Resume priority:
+            1) translation state
+            2) metadata cache
+            3) fresh metadata generation
+        """
+        # Ensure raw_text (for hashing)
+        if doc.raw_text is None and doc.file_path and ReadDocument is not None:
+            try:
+                raw = ReadDocument.from_path(doc.file_path).read(doc.file_path)
+                doc = DocumentInput(file_path=doc.file_path, raw_text=raw)
+            except Exception:
+                # keep as-is; may still work via upload-first metadata
+                pass
+
         self.state.document = doc
+
+        doc_hash: Optional[str] = None
+        if doc.raw_text:
+            doc_hash = _doc_hash_from_text(doc.raw_text)
+
+        # 1) Try resume translation first (if your state_store supports it)
+        if doc_hash and find_translation_state_by_hash and load_translation_state:
+            try:
+                p = find_translation_state_by_hash(doc_hash)
+                if p:
+                    st = load_translation_state(p)
+                    self.state.translation_state = st
+
+                    # If your TranslationWorker reads state directly, you may not need metadata_result here.
+                    # But we try to populate metadata_result if available in state.
+                    meta = st.get("metadata") if isinstance(st, dict) else None
+                    if isinstance(meta, dict) and meta:
+                        self.state.metadata_result = MetadataResult(
+                            metadata=meta,
+                            strategy_used="resume",
+                            fallback_reason=None,
+                        )
+                    self._go_translate()
+                    return
+            except Exception:
+                # If resume load fails, continue to metadata cache/fresh metadata
+                pass
+
+        # 2) Try reuse cached metadata (metadata-only resume)
+        if doc_hash:
+            p2 = find_metadata_cache_by_hash(doc_hash)
+            if p2:
+                try:
+                    rec = load_metadata_cache(p2)
+                    self.state.metadata_result = MetadataResult(
+                        metadata=dict(rec.metadata or {}),
+                        strategy_used="cached_metadata",
+                        fallback_reason=None,
+                    )
+                    self._go_translate()
+                    return
+                except Exception:
+                    pass
+
+        # 3) No resume possible -> run metadata extraction
         self._go_metadata()
 
     def _on_metadata_ready(self, metadata_result: MetadataResult) -> None:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 
 from PyQt5.QtWidgets import (
     QWidget,
@@ -28,9 +28,6 @@ class TranslatePage(QWidget):
         self._on_back = on_back
         self._worker: Optional[TranslationWorker] = None
         self._paused = False
-
-        # Will hold final translation payload from worker
-        self._result: Optional[Dict[str, Any]] = None
 
         root = QVBoxLayout()
         root.setContentsMargins(22, 22, 22, 22)
@@ -61,14 +58,8 @@ class TranslatePage(QWidget):
         self.btn_pause.clicked.connect(self._toggle_pause)
         self.btn_pause.setEnabled(False)
 
-        # ✅ NEW: download button
-        self.btn_download = QPushButton("Download .txt")
-        self.btn_download.clicked.connect(self._download_txt)
-        self.btn_download.setEnabled(False)
-
         controls.addWidget(btn_back)
         controls.addStretch(1)
-        controls.addWidget(self.btn_download)
         controls.addWidget(self.btn_pause)
 
         root.addWidget(title)
@@ -87,6 +78,8 @@ class TranslatePage(QWidget):
         document: DocumentInput,
         metadata_result: MetadataResult,
         target_language: str,
+        resume_state: Optional[Dict[str, Any]] = None,
+        resume_state_path: Optional[str] = None,
     ) -> None:
         self.banner.hide()
         self.progress.setValue(0)
@@ -96,9 +89,6 @@ class TranslatePage(QWidget):
         self.btn_pause.setEnabled(False)
         self.btn_pause.setText("Pause")
         self._paused = False
-
-        self.btn_download.setEnabled(False)
-        self._result = None
 
         if provider is None:
             self.banner.show_error("Provider is not configured.")
@@ -121,12 +111,46 @@ class TranslatePage(QWidget):
                 self.banner.show_error(f"Failed to extract text for translation: {e}")
                 return
 
+        # Decide output path:
+        # - if resuming: reuse output_txt_path from resume_state
+        # - else: ask user to choose it now
+        output_txt_path = None
+        if resume_state and isinstance(resume_state, dict):
+            output_txt_path = resume_state.get("output_txt_path")
+
+        if not output_txt_path:
+            meta = metadata_result.metadata or {}
+            title = meta.get("title") if isinstance(meta, dict) else None
+            if (
+                not isinstance(title, str)
+                or not title.strip()
+                or title == "not provided"
+            ):
+                title = "translation"
+            suggested = f"{title} ({target_language}).txt"
+
+            path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Choose where to save the translation (.txt will be written continuously)",
+                suggested,
+                "Text files (*.txt);;All files (*)",
+            )
+            if not path:
+                self.banner.show_error(
+                    "Translation cancelled: no output path selected."
+                )
+                return
+            output_txt_path = path
+
         self._worker = TranslationWorker(
             provider=provider,
             settings=settings,
             document=document,
             metadata_result=metadata_result,
             target_language=target_language,
+            output_txt_path=str(output_txt_path),
+            resume_state=resume_state,
+            resume_state_path=resume_state_path,
         )
         self._worker.progressed.connect(self._on_progress)
         self._worker.chunk_done.connect(self._on_chunk_done)
@@ -144,21 +168,13 @@ class TranslatePage(QWidget):
         self.output_preview.append(text)
         self.output_preview.append("\n" + ("-" * 40) + "\n")
 
-    def _on_success(self, obj: object) -> None:
-        # Save payload for export
-        if isinstance(obj, dict):
-            self._result = obj  # contains "metadata", "target_language", "translations"
-        else:
-            self._result = None
-
+    def _on_success(self, _obj: object) -> None:
         self.stage.setText("Translation complete.")
         self.btn_pause.setEnabled(False)
-        self.btn_download.setEnabled(self._result is not None)
 
     def _on_fail(self, msg: str) -> None:
         self.banner.show_error(msg)
         self.btn_pause.setEnabled(False)
-        self.btn_download.setEnabled(False)
 
     def _toggle_pause(self) -> None:
         if not self._worker:
@@ -172,61 +188,3 @@ class TranslatePage(QWidget):
             self._worker.request_resume()
             self._paused = False
             self.btn_pause.setText("Pause")
-
-    def _download_txt(self) -> None:
-        if not self._result:
-            self.banner.show_error("No translation available to export yet.")
-            return
-
-        meta = self._result.get("metadata") or {}
-        target_language = self._result.get("target_language") or "Unknown"
-        translations: List[Dict[str, str]] = self._result.get("translations") or []
-
-        # Suggest a filename
-        title = meta.get("title") if isinstance(meta, dict) else None
-        title = (
-            title
-            if isinstance(title, str) and title.strip() and title != "not provided"
-            else "translation"
-        )
-        suggested = f"{title} ({target_language}).txt"
-
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save translation as .txt",
-            suggested,
-            "Text files (*.txt);;All files (*)",
-        )
-        if not path:
-            return
-
-        # Build file content
-        lines: List[str] = []
-        if isinstance(meta, dict):
-            lines.append(f"Title: {meta.get('title', 'not provided')}")
-            lines.append(f"Author(s): {meta.get('author(s)', 'not provided')}")
-            lines.append(f"Source language: {meta.get('language', 'not provided')}")
-        lines.append(f"Target language: {target_language}")
-        lines.append("")
-        lines.append("=" * 80)
-        lines.append("")
-
-        last_chapter = None
-        for item in translations:
-            ch = item.get("chapter") if isinstance(item, dict) else None
-            tr = item.get("translation") if isinstance(item, dict) else None
-            if isinstance(ch, str) and ch.strip() and ch != last_chapter:
-                lines.append(f"\n## {ch.strip()}\n")
-                last_chapter = ch.strip()
-            if isinstance(tr, str) and tr.strip():
-                lines.append(tr.strip())
-                lines.append("")
-
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines).strip() + "\n")
-        except Exception as e:
-            self.banner.show_error(f"Failed to save file: {e}")
-            return
-
-        self.banner.show_info(f"Saved: {path}")

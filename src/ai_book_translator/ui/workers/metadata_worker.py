@@ -15,15 +15,23 @@ except Exception:
 
 class MetadataWorker(QThread):
     progressed = pyqtSignal(int, str)  # pct, stage
-    succeeded = pyqtSignal(object)     # MetadataResult
+    succeeded = pyqtSignal(object)  # MetadataResult
     failed = pyqtSignal(str)
 
-    def __init__(self, provider: LLMProvider, settings: Settings, document: DocumentInput, target_language: str):
+    def __init__(
+        self,
+        provider: LLMProvider,
+        settings: Settings,
+        document: DocumentInput,
+        target_language: str,
+        display_name: str = "",
+    ):
         super().__init__()
         self.provider = provider
         self.settings = settings
         self.document = document
         self.target_language = target_language
+        self.display_name = display_name or "document"
 
     def run(self) -> None:
         try:
@@ -37,10 +45,14 @@ class MetadataWorker(QThread):
                 except Exception:
                     doc = self.document
 
-            self.progressed.emit(15, "Generating metadata JSON…")
+            self.progressed.emit(
+                15, f"Generating metadata JSON for {self.display_name}…"
+            )
 
             svc = MetadataService(self.provider, self.settings)
-            res: MetadataResult = svc.generate_metadata(doc, target_language=self.target_language)
+            res: MetadataResult = svc.generate_metadata(
+                doc, target_language=self.target_language
+            )
 
             self.progressed.emit(100, "Done")
             self.succeeded.emit(res)

@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from typing import Callable, Optional
 
-from PyQt5.QtWidgets import QWidget, QVBoxLayout, QLabel, QPushButton, QHBoxLayout, QTextEdit
+from PyQt5.QtWidgets import (
+    QWidget,
+    QVBoxLayout,
+    QLabel,
+    QPushButton,
+    QHBoxLayout,
+    QTextEdit,
+)
 
 from ai_book_translator.config.settings import Settings
 from ai_book_translator.domain.models import DocumentInput, MetadataResult
@@ -14,7 +21,9 @@ from ..workers.metadata_worker import MetadataWorker
 
 
 class MetadataPage(QWidget):
-    def __init__(self, on_done: Callable[[MetadataResult], None], on_back: Callable[[], None]):
+    def __init__(
+        self, on_done: Callable[[MetadataResult], None], on_back: Callable[[], None]
+    ):
         super().__init__()
         self._on_done = on_done
         self._on_back = on_back
@@ -54,7 +63,13 @@ class MetadataPage(QWidget):
 
         self.setLayout(root)
 
-    def start(self, provider: LLMProvider, settings: Settings, document: DocumentInput, target_language: str) -> None:
+    def start(
+        self,
+        provider: LLMProvider,
+        settings: Settings,
+        document: DocumentInput,
+        target_language: str,
+    ) -> None:
         self.banner.hide()
         self.progress.set_progress(0)
         self.progress.set_stage("")
@@ -69,7 +84,19 @@ class MetadataPage(QWidget):
             self.banner.show_error("No document provided.")
             return
 
-        self._worker = MetadataWorker(provider=provider, settings=settings, document=document, target_language=target_language)
+        display_name = ""
+        if document.file_path:
+            display_name = str(document.file_path)
+        else:
+            display_name = "pasted text"
+
+        self._worker = MetadataWorker(
+            provider=provider,
+            settings=settings,
+            document=document,
+            target_language=target_language,
+            display_name=display_name,
+        )
         self._worker.progressed.connect(self._on_progress)
         self._worker.succeeded.connect(self._on_success)
         self._worker.failed.connect(self._on_fail)
@@ -81,8 +108,11 @@ class MetadataPage(QWidget):
 
     def _on_success(self, res: MetadataResult) -> None:
         import json
+
         self._last_result = res
-        self.preview.setPlainText(json.dumps(res.metadata, ensure_ascii=False, indent=2))
+        self.preview.setPlainText(
+            json.dumps(res.metadata, ensure_ascii=False, indent=2)
+        )
         self.btn_continue.setEnabled(True)
 
     def _on_fail(self, msg: str) -> None:
