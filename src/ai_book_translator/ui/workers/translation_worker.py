@@ -212,8 +212,6 @@ Output JSON only.
                         current_chapter = ch.strip()
 
                     # Append to output TXT immediately
-                    if current_chapter:
-                        fp.write(f"\n\n## {current_chapter}\n\n")
                     fp.write(tr.strip())
                     fp.write("\n")
                     fp.flush()
