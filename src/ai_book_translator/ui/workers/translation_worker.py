@@ -70,7 +70,7 @@ class TranslationWorker(QThread):
         lines.append(f"Title: {meta.get('title', 'not provided')}")
         lines.append(f"Author(s): {meta.get('author(s)', 'not provided')}")
         lines.append(f"Source language: {meta.get('language', 'not provided')}")
-        lines.append(f"Target language: {target_language}")
+        lines.append(f"Translated to: {target_language}")
         lines.append("")
         lines.append("=" * 80)
         lines.append("")
