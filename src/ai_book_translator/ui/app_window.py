@@ -156,7 +156,20 @@ class AppWindow(QMainWindow):
 
                     # If your TranslationWorker reads state directly, you may not need metadata_result here.
                     # But we try to populate metadata_result if available in state.
-                    meta = st.get("metadata") if isinstance(st, dict) else None
+                    meta = st.get("metadata")
+                    
+                    # Handle metadata_path if full metadata object is missing (new schema) ---
+                    if not meta and "metadata_path" in st:
+                        try:
+                            mpath = st["metadata_path"]
+                            if mpath:
+                                rec = load_metadata_cache(mpath)
+                                if rec and rec.metadata:
+                                    meta = rec.metadata
+                        except Exception:
+                            pass
+                    # -------------------------------------------------------------------------------
+
                     if isinstance(meta, dict) and meta:
                         self.state.metadata_result = MetadataResult(
                             metadata=meta,
