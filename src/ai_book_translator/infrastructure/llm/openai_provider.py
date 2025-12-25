@@ -28,7 +28,7 @@ class OpenAIResponsesProvider(LLMProvider):
         api_key: Optional[str] = None,
         model: str = "gpt-5-nano",
         base_url: str = "https://api.openai.com",
-        timeout_sec: int = 400,
+        timeout_sec: int = 1000,
     ):
         if api_key is None:
             api_key = os.getenv("OPENAI_API_KEY")
@@ -157,6 +157,7 @@ class OpenAIResponsesProvider(LLMProvider):
         payload.update(kwargs)
 
         resp = self._post_json(url, payload)
+        # self._raise_if_incomplete(resp, url=url)
         text = self._extract_output_text(resp)
         if not text:
             raise LLMError(
@@ -207,6 +208,7 @@ class OpenAIResponsesProvider(LLMProvider):
 
         try:
             resp = self._post_json(url, payload)
+            # self._raise_if_incomplete(resp, url=url)
         except LLMError as e:
             # If the model/endpoint refuses file input, treat as "not supported" for upload-first.
             msg = str(e).lower()
@@ -232,6 +234,32 @@ class OpenAIResponsesProvider(LLMProvider):
                 f"Empty output_text after file input. Raw response: {resp}"
             )
         return text
+
+    def x(self, resp: Dict[str, Any], *, url: str) -> None:
+        status = resp.get("status")
+        if status != "incomplete":
+            return
+
+        details = resp.get("incomplete_details") or {}
+        reason = details.get("reason") or "unknown"
+
+        # content_filter is NOT transient — retries usually won't help
+        if reason == "content_filter":
+            raise LLMError(
+                "OpenAI blocked this chunk (content_filter). "
+                "Try a smaller chunk size, or locate the offending chunk text. "
+                f"Raw incomplete_details: {details}"
+            )
+
+        # max_output_tokens is usually fixable by increasing the limit
+        if reason == "max_output_tokens":
+            raise LLMError(
+                "Response was cut off due to max_output_tokens. Increase max_output_tokens."
+            )
+
+        raise LLMError(
+            f"Responses API returned incomplete status: reason={reason}, details={details}, url={url}"
+        )
 
     def _looks_like_unsupported_schema_error(msg: str) -> bool:
         m = msg.lower()

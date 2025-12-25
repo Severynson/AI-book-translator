@@ -6,12 +6,11 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+from .paths import state_dir
 
 
 def _default_state_dir() -> Path:
-    # Store resumable state in a stable per-user location.
-    # You can change this later if you want it under project/ folder.
-    d = Path.home() / ".ai_book_translator" / "translation_state"
+    d = state_dir() / "translation_state"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

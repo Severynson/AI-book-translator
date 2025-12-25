@@ -92,67 +92,97 @@ class TranslationWorker(QThread):
             meta = dict(self.metadata_result.metadata or {})
             author = meta.get("author(s)")
             title = meta.get("title")
+
             opt_ctx: Dict[str, Any] = {}
-            if author and author != "not provided":
+            if isinstance(author, str) and author and author != "not provided":
                 opt_ctx["author(s)"] = author
-            if title and title != "not provided":
+            if isinstance(title, str) and title and title != "not provided":
                 opt_ctx["title"] = title
 
-            # Resume values (if any)
+            # Resume defaults
             start_index = 0
             current_chapter: Optional[str] = None
             prev_tail = ""
 
-            state_path: Path
+            # Prepare output path early (needed for preflight state object)
+            out_path = Path(self.output_txt_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Determine state path
             if self.resume_state_path:
                 state_path = Path(self.resume_state_path)
             else:
                 state_path = make_state_path(
-                    title=title if isinstance(title, str) else None, doc_hash=doc_hash
+                    title=title if isinstance(title, str) else None,
+                    doc_hash=doc_hash,
                 )
 
+            # If resume state exists and matches this document, apply it
             if self.resume_state and isinstance(self.resume_state, dict):
-                # Only resume if the stored hash matches
                 if self.resume_state.get("document_hash") == doc_hash:
-                    start_index = int(
-                        self.resume_state.get("current_chunk_index", 0) or 0
+                    try:
+                        start_index = int(
+                            self.resume_state.get("current_chunk_index") or 0
+                        )
+                    except Exception:
+                        start_index = 0
+
+                    ch0 = self.resume_state.get("current_chapter")
+                    current_chapter = (
+                        ch0 if isinstance(ch0, str) and ch0.strip() else None
                     )
-                    current_chapter = self.resume_state.get("current_chapter") or None
-                    prev_tail = self.resume_state.get("last_translation_tail") or ""
-                # else: silently treat as fresh
+
+                    t0 = self.resume_state.get("last_translation_tail")
+                    prev_tail = t0 if isinstance(t0, str) else ""
+
+                    # Prefer the previously used output path if it exists in state
+                    p0 = self.resume_state.get("output_txt_path")
+                    if isinstance(p0, str) and p0.strip():
+                        out_path = Path(p0)
+                        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Save a preflight state so resume works even if chunk 0 fails
+            preflight_state: Dict[str, Any] = {
+                "document_hash": doc_hash,
+                "output_txt_path": str(out_path),
+                "current_chunk_index": start_index,  # next chunk to translate
+                "chunks_total": total,
+                "current_chapter": current_chapter or "",
+                "last_translation_tail": prev_tail or "",
+                "metadata": meta,
+                "target_language": self.target_language,
+                "translation_chunk_chars": int(self.settings.translation_chunk_chars),
+                "updated_at_unix": int(time.time()),
+            }
+            save_state(state_path, preflight_state)
 
             # Open output file in append mode (always incremental)
-            out_path = Path(self.output_txt_path)
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-
             with open(out_path, "a", encoding="utf-8") as fp:
                 self._write_header_if_needed(fp, meta, self.target_language)
 
-                # If resuming, show a message in UI
                 if start_index > 0:
                     self.progressed.emit(
                         int((start_index / total) * 100),
-                        f"Resuming from chunk {start_index+1}/{total}…",
+                        f"Resuming from chunk {start_index + 1}/{total}…",
                     )
 
                 for i in range(start_index, len(chunks)):
                     while self._pause:
                         self.msleep(150)
 
-                    pct = int((i / total) * 100)
+                    pct = int(((i + 1) / total) * 100)
                     self.progressed.emit(pct, f"Translating chunk {i+1}/{total}…")
 
                     chunk = chunks[i]
 
                     sys = (
                         "You are a professional book translator. "
-                        'Return STRICT JSON only: {"chapter": "...", "translation": "..."}. '
+                        'Return STRICT JSON only: {"chapter": "...", "translation": "..."}.\n'
                         "No markdown. No commentary.\n\n"
                         f"Previous translation tail (last 300 chars):\n{prev_tail}"
                     )
 
                     ctx_block = f"Optional context: {opt_ctx}\n" if opt_ctx else ""
-
                     usr = f"""
 {ctx_block}Target language: {self.target_language}
 Current chapter (from previous chunk, may overwrite if new chapter begins): {current_chapter}

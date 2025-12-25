@@ -33,14 +33,13 @@ def _doc_hash_from_text(text: str) -> str:
 
 # ---- Translation resume (adapt imports to your actual module) ----
 try:
-    # If you already implemented state resume, adapt names here.
-    from ai_book_translator.infrastructure.persistence.state_store import (
-        find_translation_state_by_hash,
-        load_translation_state,
+    from ai_book_translator.infrastructure.persistence.translation_state import (
+        find_state_by_hash,
+        load_state,
     )
 except Exception:
-    find_translation_state_by_hash = None
-    load_translation_state = None
+    find_state_by_hash = None
+    load_state = None
 
 
 @dataclass
@@ -50,6 +49,7 @@ class AppState:
     document: Optional[DocumentInput] = None
     metadata_result: Optional[MetadataResult] = None
     translation_state: Optional[Dict[str, Any]] = None
+    translation_state_path: Optional[str] = None
 
 
 class AppWindow(QMainWindow):
@@ -103,6 +103,8 @@ class AppWindow(QMainWindow):
             document=self.state.document,
             metadata_result=self.state.metadata_result,
             target_language=self.state.target_language,
+            resume_state=self.state.translation_state,
+            resume_state_path=self.state.translation_state_path,
         )
 
     def _on_model_ready(
@@ -134,17 +136,23 @@ class AppWindow(QMainWindow):
 
         self.state.document = doc
 
+        # Reset state related to previous document
+        self.state.translation_state = None
+        self.state.translation_state_path = None
+        self.state.metadata_result = None
+
         doc_hash: Optional[str] = None
         if doc.raw_text:
             doc_hash = _doc_hash_from_text(doc.raw_text)
 
         # 1) Try resume translation first (if your state_store supports it)
-        if doc_hash and find_translation_state_by_hash and load_translation_state:
+        if doc_hash and find_state_by_hash:
             try:
-                p = find_translation_state_by_hash(doc_hash)
-                if p:
-                    st = load_translation_state(p)
+                found = find_state_by_hash(doc_hash)
+                if found:
+                    p, st = found
                     self.state.translation_state = st
+                    self.state.translation_state_path = str(p)
 
                     # If your TranslationWorker reads state directly, you may not need metadata_result here.
                     # But we try to populate metadata_result if available in state.

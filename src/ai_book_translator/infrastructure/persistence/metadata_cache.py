@@ -6,11 +6,10 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
-
+from .paths import state_dir
 
 def _default_state_dir() -> Path:
-    # Keep persistence under user home; simple and stable.
-    d = Path.home() / ".ai_book_translator" / "state"
+    d = state_dir() / "metadata_cache"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

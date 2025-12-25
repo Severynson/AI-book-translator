@@ -106,7 +106,7 @@ class MetadataService:
                         "schema": METADATA_SCHEMA,
                     }
                 },
-                max_output_tokens=1200,
+                max_output_tokens=2000,
                 **kwargs,
             )
         except Exception:
@@ -125,7 +125,7 @@ class MetadataService:
             system_prompt=system,
             user_prompt=user,
             file_path=file_path,
-            max_output_tokens=1200,
+            max_output_tokens=2000,
             **kwargs,
         )
 

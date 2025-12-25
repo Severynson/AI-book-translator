@@ -6,6 +6,12 @@ from ai_book_translator.config.settings import Settings
 from ai_book_translator.domain.models import DocumentInput, MetadataResult
 from ai_book_translator.infrastructure.llm.base import LLMProvider
 from ai_book_translator.services.metadata_service import MetadataService
+from ai_book_translator.infrastructure.persistence.metadata_cache import (
+    save_metadata_cache,
+)
+from ai_book_translator.infrastructure.persistence.translation_state import (
+    compute_document_hash,
+)
 
 try:
     from ai_book_translator.infrastructure.io.read_document.base import ReadDocument
@@ -53,6 +59,23 @@ class MetadataWorker(QThread):
             res: MetadataResult = svc.generate_metadata(
                 doc, target_language=self.target_language
             )
+
+            doc_hash = compute_document_hash(doc.raw_text or "")
+            title_hint = ""
+            try:
+                t = (res.metadata or {}).get("title")
+                if isinstance(t, str):
+                    title_hint = t
+            except Exception:
+                pass
+
+            p = save_metadata_cache(
+                document_hash=doc_hash,
+                metadata=dict(res.metadata or {}),
+                target_language=self.target_language,
+                title_hint=title_hint,
+            )
+            self.progressed.emit(95, f"Cached metadata: {p}")
 
             self.progressed.emit(100, "Done")
             self.succeeded.emit(res)
