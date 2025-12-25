@@ -90,7 +90,9 @@ def test_upload_success(monkeypatch, settings):
             "title": "T",
             "language": "en",
             "summary": "S",
-            "chapters": {},
+            "chapters": {
+                "ch1": {"general": "g1", "detailed": "d1"}
+            },
         },
     )
 
@@ -213,7 +215,12 @@ def test_upload_invalid_json_triggers_repair(monkeypatch, settings):
     provider = FakeProvider()
     svc = MetadataService(provider, settings)
 
-    provider.doc_behaviors = ["NOT_JSON"]
+    # We need TWO responses:
+    # 1. The first call (structured output attempt) returns invalid JSON.
+    # 2. The code catches that exception and calls chat_text_with_document AGAIN (fallback prompt mode).
+    #    That second call also returns "NOT_JSON" (or whatever).
+    # 3. Then parse_json_strict fails again, and it calls chat_json_strict_with_repair.
+    provider.doc_behaviors = ["NOT_JSON", "NOT_JSON"]
 
     def parse_fail(_raw):
         raise InvalidJSONError("bad json")
@@ -230,7 +237,12 @@ def test_upload_invalid_json_triggers_repair(monkeypatch, settings):
             "title": "T",
             "language": "en",
             "summary": "S",
-            "chapters": {},
+            "chapters": {
+                "Chapter 1": {
+                    "general": "The beginning.",
+                    "detailed": "A very detailed summary of the beginning."
+                }
+            },
         },
     )
 

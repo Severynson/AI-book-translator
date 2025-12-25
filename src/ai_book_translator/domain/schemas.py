@@ -26,10 +26,20 @@ def validate_metadata_json(obj: Dict[str, Any]) -> None:
     if not isinstance(obj.get("chapters"), dict):
         raise SchemaValidationError('"chapters" must be an object/dict')
 
-    # Ensure chapters values are strings
+    # Ensure chapters values are correct structure
     for k, v in obj["chapters"].items():
-        if not isinstance(k, str) or not isinstance(v, str):
-            raise SchemaValidationError('"chapters" must map string -> string')
+        if not isinstance(k, str):
+            raise SchemaValidationError('"chapters" keys must be strings')
+        
+        # New structure check
+        if not isinstance(v, dict):
+             raise SchemaValidationError(f'"chapters" value for "{k}" must be an object with "general" and "detailed"')
+        
+        if "general" not in v or "detailed" not in v:
+             raise SchemaValidationError(f'"chapters" value for "{k}" missing "general" or "detailed"')
+        
+        if not isinstance(v.get("general"), str) or not isinstance(v.get("detailed"), str):
+             raise SchemaValidationError(f'"chapters" value for "{k}" must have string values for "general" and "detailed"')
 
 
 def normalize_not_provided(obj: Dict[str, Any]) -> Dict[str, Any]:

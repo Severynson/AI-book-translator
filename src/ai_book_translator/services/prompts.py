@@ -12,7 +12,8 @@ METADATA_SYSTEM_PROMPT = (
     'If a field is not present, use the EXACT string "not provided", '
     "EXCEPT for fields explicitly marked below as inferable or generatable. "
     '"author(s)" MUST be a single string of names separated by comma+space (", "), never an array. '
-    '"chapters" MUST be a JSON object where each key is a chapter identifier string and each value is a short summary string; '
+    '"chapters" MUST be a JSON object where each key is a chapter identifier string and each value is an object '
+    'with two keys: "general" (a short 1-3 sentence summary) and "detailed" (a detailed short essay summary); '
     "if chapters cannot be inferred, output an empty object {}.\n\n"
 
     "IMPORTANT — INFERENCE & GENERATION RULES:\n"
@@ -60,12 +61,12 @@ METADATA_REPAIR_PROMPT = (
     '- "chapters":\n'
     "  • MUST be a JSON OBJECT (dictionary)\n"
     "  • Each KEY must be a chapter identifier (string)\n"
-    "  • Each VALUE must be a SHORT STRING summary of that chapter\n"
+    "  • Each VALUE must be an OBJECT with exactly two keys: \"general\" (1-3 sentences) and \"detailed\" (short essay)\n"
     "  • MUST NOT be an array\n"
     "  • If chapters cannot be inferred, use an EMPTY OBJECT {}\n\n"
     "ADDITIONAL STRICT RULES:\n"
     "- NO additional keys are allowed (additionalProperties = false).\n"
-    '- All values MUST be strings, except "chapters" which is an object of string → string.\n'
+    '- All values MUST be strings, except "chapters" which is an object of string → object.\n'
     "- Do NOT invent information for fields: title, authors, chapters.\n"
     "- Do NOT omit required keys.\n"
     "EXAMPLE OF A CORRECT RESPONSE (FORMAT ONLY):\n"
@@ -75,10 +76,14 @@ METADATA_REPAIR_PROMPT = (
     '  "language": "German",\n'
     '  "summary": "This work explores the structure and dynamics of the unconscious mind, introducing foundational concepts of analytical psychology such as archetypes, the collective unconscious, and symbolic interpretation of mythological and psychological material.",\n'
     '  "chapters": {\n'
-    '    "Chapter 1": "Introduction to the concept of the unconscious and its role in psychological life.",\n'
-    '    "Chapter 2": "Analysis of mythological symbols and their psychological significance.",\n'
-    '    "Chapter 3": "Discussion of archetypes and the collective unconscious.",\n'
-    '    "Chapter 4": "Implications of unconscious processes for individual development."\n'
+    '    "Chapter 1": {\n'
+    '      "general": "Introduction to the concept of the unconscious and its role in psychological life.",\n'
+    '      "detailed": "Jung introduces the concept of the unconscious not as a mere repository of repressed memories, but as a dynamic and creative force..."\n'
+    '    },\n'
+    '    "Chapter 2": {\n'
+    '      "general": "Analysis of mythological symbols and their psychological significance.",\n'
+    '      "detailed": "In this chapter, the author examines various myths from different cultures to demonstrate the universality of certain symbols..."\n'
+    '    }\n'
     "  }\n"
     "}\n\n"
     "INPUT TO REPAIR:\n"

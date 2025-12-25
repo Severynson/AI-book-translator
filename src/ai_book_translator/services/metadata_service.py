@@ -86,7 +86,15 @@ class MetadataService:
                 "summary": {"type": "string"},
                 "chapters": {
                     "type": "object",
-                    "additionalProperties": {"type": "string"},
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                            "general": {"type": "string"},
+                            "detailed": {"type": "string"},
+                        },
+                        "required": ["general", "detailed"],
+                        "additionalProperties": False,
+                    },
                 },
             },
         }
@@ -109,7 +117,11 @@ class MetadataService:
                 max_output_tokens=2000,
                 **kwargs,
             )
+        except (UploadNotSupportedError, UploadFailedError, TransientLLMError):
+            # Critical errors should bubble up to generate_metadata handler
+            raise
         except Exception:
+            # Other errors (e.g. model doesn't support structured outputs): fall back to prompt-only
             raw = None
 
         # If schema-mode produced something, try parsing it directly
