@@ -138,11 +138,51 @@ def build_summary_of_summaries_user_prompt(
 
 
 def build_translation_system_prompt(previous_tail: str) -> str:
-    return (
-        "You are a professional book translator. "
+
+    # TODO remove
+    print("SYSTEM PROMPT 4 TRANSLATION -->", (
+        "You are a professional book translator.\n"
         'Return STRICT JSON only: {"chapter": "...", "translation": "..."}.\n'
         'The "chapter" field MUST match the exact chapter key from the "Chapters Context".\n'
-        "No markdown. No commentary.\n\n"
+        "If you clearly detect the start of a NEW chapter in the chunk text, update the chapter.\n"
+        "Otherwise, keep the current chapter provided in the user prompt.\n"
+        "If unsure whether a new chapter starts, do NOT change the chapter.\n"
+        "No markdown. No commentary.\n"
+        "\n"
+        "TRANSLATION OUTPUT RULES:\n"
+        "- The translated text must preserve the original meaning and paragraph structure.\n"
+        "- Lines that contain ONLY a page number (e.g., '12') surrounded by blank lines MUST be omitted.\n"
+        "- Meaningful numbered items (e.g., '1. Introduction', references, equations, figure/table numbers) MUST be kept.\n"
+        "\n"
+        "FORMATTING REPAIR RULES (apply only if clearly needed):\n"
+        "- If a TAB character (\\t) appears in the middle of a line and likely represents a broken line break,\n"
+        "  replace it with a newline followed by a tab ('\\n\\t') in the translation.\n"
+        "- Do NOT modify tabs that are clearly used for tables, code blocks, or aligned columns.\n"
+        "- Do NOT intentionally add or remove paragraphs.\n"
+        "\n\n"
+        f"Previous translation tail (last 300 chars):\n{previous_tail}"
+    ))
+
+    return (
+        "You are a professional book translator.\n"
+        'Return STRICT JSON only: {"chapter": "...", "translation": "..."}.\n'
+        'The "chapter" field MUST match the exact chapter key from the "Chapters Context".\n'
+        "If you clearly detect the start of a NEW chapter in the chunk text, update the chapter.\n"
+        "Otherwise, keep the current chapter provided in the user prompt.\n"
+        "If unsure whether a new chapter starts, do NOT change the chapter.\n"
+        "No markdown. No commentary.\n"
+        "\n"
+        "TRANSLATION OUTPUT RULES:\n"
+        "- The translated text must preserve the original meaning and paragraph structure.\n"
+        "- Lines that contain ONLY a page number (e.g., '12') surrounded by blank lines MUST be omitted.\n"
+        "- Meaningful numbered items (e.g., '1. Introduction', references, equations, figure/table numbers) MUST be kept.\n"
+        "\n"
+        "FORMATTING REPAIR RULES (apply only if clearly needed):\n"
+        "- If a TAB character (\\t) appears in the middle of a line and likely represents a broken line break,\n"
+        "  replace it with a newline followed by a tab ('\\n\\t') in the translation.\n"
+        "- Do NOT modify tabs that are clearly used for tables, code blocks, or aligned columns.\n"
+        "- Do NOT intentionally add or remove paragraphs.\n"
+        "\n\n"
         f"Previous translation tail (last 300 chars):\n{previous_tail}"
     )
 
@@ -183,13 +223,16 @@ def build_translation_user_prompt(
                 # Check if this is the current chapter
                 # Normalization: simple strip/lower check or direct match
                 is_current = False
-                if current_chapter and str(ch_id).strip() == str(current_chapter).strip():
+                if (
+                    current_chapter
+                    and str(ch_id).strip() == str(current_chapter).strip()
+                ):
                     is_current = True
 
                 desc = ch_data.get("detailed" if is_current else "general")
                 if desc:
                     chapter_lines.append(f"- {ch_id} - {desc}")
-            
+
             if chapter_lines:
                 context_parts.append("Chapters Context:")
                 context_parts.extend(chapter_lines)
@@ -198,19 +241,16 @@ def build_translation_user_prompt(
     if context_parts:
         ctx_block = "Context:\n" + "\n".join(context_parts) + "\n\n"
 
-    # TODO remove
-    print(
-        f"{ctx_block}Target language: {target_language}\n"
-        f"Current chapter (from previous chunk, may overwrite if new chapter begins): {current_chapter}\n\n"
-        "Chunk text:\n"
-        f"{chunk_text}\n\n"
-        "Output JSON only."
-    )
-
     return (
-        f"{ctx_block}Target language: {target_language}\n"
-        f"Current chapter (from previous chunk, may overwrite if new chapter begins): {current_chapter}\n\n"
-        "Chunk text:\n"
-        f"{chunk_text}\n\n"
+        f"{ctx_block}"
+        f"Target language: {target_language}\n"
+        f"Current chapter (from previous chunk; keep unless a new chapter clearly starts): {current_chapter}\n\n"
+        "TASK:\n"
+        "1) Translate ONLY the text inside <TEXT_TO_TRANSLATE> ... </TEXT_TO_TRANSLATE>.\n"
+        "2) Do NOT translate any other parts of this prompt (Context, Target language line, etc.).\n"
+        "3) Return STRICT JSON only.\n\n"
+        "<TEXT_TO_TRANSLATE>\n"
+        f"{chunk_text}\n"
+        "</TEXT_TO_TRANSLATE>\n\n"
         "Output JSON only."
     )

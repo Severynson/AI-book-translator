@@ -123,6 +123,14 @@ class TranslationWorker(QThread):
             start_index = 0
             current_chapter: Optional[str] = None
             prev_tail = ""
+            
+            # --- IMPROVEMENT: Initialize current_chapter if starting fresh ---
+            if not self.resume_state:
+                 chapters_map = meta.get("chapters")
+                 if isinstance(chapters_map, dict) and chapters_map:
+                     # Pick the very first key as the starting chapter
+                     current_chapter = next(iter(chapters_map))
+            # -----------------------------------------------------------------
 
             # Prepare output path early (needed for preflight state object)
             out_path = Path(self.output_txt_path)
