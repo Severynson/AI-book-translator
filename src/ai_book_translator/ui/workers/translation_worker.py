@@ -93,15 +93,31 @@ class TranslationWorker(QThread):
             chunks = chunk_by_chars(raw_text, self.settings.translation_chunk_chars)
             total = max(1, len(chunks))
 
-            meta = dict(self.metadata_result.metadata or {})
-            author = meta.get("author(s)")
-            title = meta.get("title")
+            from ai_book_translator.infrastructure.persistence.metadata_cache import (
+                find_metadata_cache_by_hash,
+                load_metadata_cache,
+            )
 
+            # 1. Resolve metadata source (always prefer disk cache)
+            meta_path = find_metadata_cache_by_hash(doc_hash)
+            meta = {}
+            if meta_path:
+                try:
+                    record = load_metadata_cache(meta_path)
+                    if record and record.metadata:
+                        meta = dict(record.metadata)
+                except Exception:
+                    # Fallback to in-memory if disk load fails
+                    meta = dict(self.metadata_result.metadata or {})
+            else:
+                 meta = dict(self.metadata_result.metadata or {})
+
+            # Use all available metadata as context
             opt_ctx: Dict[str, Any] = {}
-            if isinstance(author, str) and author and author != "not provided":
-                opt_ctx["author(s)"] = author
-            if isinstance(title, str) and title and title != "not provided":
-                opt_ctx["title"] = title
+            for k in ["author(s)", "title", "summary", "chapters"]:
+                val = meta.get(k)
+                if val and val != "not provided":
+                    opt_ctx[k] = val
 
             # Resume defaults
             start_index = 0
@@ -116,6 +132,7 @@ class TranslationWorker(QThread):
             if self.resume_state_path:
                 state_path = Path(self.resume_state_path)
             else:
+                title = meta.get("title")
                 state_path = make_state_path(
                     title=title if isinstance(title, str) else None,
                     doc_hash=doc_hash,
@@ -153,7 +170,7 @@ class TranslationWorker(QThread):
                 "chunks_total": total,
                 "current_chapter": current_chapter or "",
                 "last_translation_tail": prev_tail or "",
-                "metadata": meta,
+                "metadata_path": str(meta_path) if meta_path else "",
                 "target_language": self.target_language,
                 "translation_chunk_chars": int(self.settings.translation_chunk_chars),
                 "updated_at_unix": int(time.time()),
@@ -220,7 +237,7 @@ class TranslationWorker(QThread):
                         "chunks_total": total,
                         "current_chapter": current_chapter or "",
                         "last_translation_tail": prev_tail,
-                        "metadata": meta,
+                        "metadata_path": str(meta_path) if meta_path else "",
                         "target_language": self.target_language,
                         "translation_chunk_chars": int(
                             self.settings.translation_chunk_chars
