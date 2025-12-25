@@ -235,7 +235,7 @@ class TranslationWorker(QThread):
                     fp.write("\n")
                     fp.flush()
 
-                    prev_tail = tr[-300:] if len(tr) > 300 else tr
+                    prev_tail = chunk[-300:] if len(chunk) > 300 else chunk
 
                     # Persist state after each successful chunk
                     state_obj: Dict[str, Any] = {

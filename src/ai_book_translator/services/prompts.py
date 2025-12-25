@@ -160,7 +160,7 @@ def build_translation_system_prompt(previous_tail: str) -> str:
         "- Do NOT modify tabs that are clearly used for tables, code blocks, or aligned columns.\n"
         "- Do NOT intentionally add or remove paragraphs.\n"
         "\n\n"
-        f"Previous translation tail (last 300 chars):\n{previous_tail}"
+        f"Tail of the previous chunk of source text (last 300 chars):\n{previous_tail}"
     ))
 
     return (
@@ -183,7 +183,7 @@ def build_translation_system_prompt(previous_tail: str) -> str:
         "- Do NOT modify tabs that are clearly used for tables, code blocks, or aligned columns.\n"
         "- Do NOT intentionally add or remove paragraphs.\n"
         "\n\n"
-        f"Previous translation tail (last 300 chars):\n{previous_tail}"
+        f"Tail of the previous chunk of source text (last 300 chars):\n{previous_tail}"
     )
 
 
