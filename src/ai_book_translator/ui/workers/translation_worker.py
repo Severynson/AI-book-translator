@@ -11,6 +11,10 @@ from ai_book_translator.domain.models import DocumentInput, MetadataResult
 from ai_book_translator.infrastructure.llm.base import LLMProvider
 from ai_book_translator.services.chunking import chunk_by_chars
 from ai_book_translator.services.llm_json import chat_json_strict_with_repair
+from ai_book_translator.services.prompts import (
+    build_translation_system_prompt,
+    build_translation_user_prompt,
+)
 
 from ai_book_translator.infrastructure.persistence.translation_state import (
     compute_document_hash,
@@ -175,23 +179,13 @@ class TranslationWorker(QThread):
 
                     chunk = chunks[i]
 
-                    sys = (
-                        "You are a professional book translator. "
-                        'Return STRICT JSON only: {"chapter": "...", "translation": "..."}.\n'
-                        "No markdown. No commentary.\n\n"
-                        f"Previous translation tail (last 300 chars):\n{prev_tail}"
+                    sys = build_translation_system_prompt(prev_tail)
+                    usr = build_translation_user_prompt(
+                        chunk_text=chunk,
+                        target_language=self.target_language,
+                        current_chapter=current_chapter,
+                        context=opt_ctx,
                     )
-
-                    ctx_block = f"Optional context: {opt_ctx}\n" if opt_ctx else ""
-                    usr = f"""
-{ctx_block}Target language: {self.target_language}
-Current chapter (from previous chunk, may overwrite if new chapter begins): {current_chapter}
-
-Chunk text:
-{chunk}
-
-Output JSON only.
-""".strip()
 
                     obj = chat_json_strict_with_repair(
                         provider=self.provider,

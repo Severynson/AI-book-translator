@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import List
+from typing import List, Any, Dict, Optional
 
 # =========================
 # STEP 1 — METADATA (UPLOAD / GLOBAL)
@@ -125,4 +125,33 @@ def build_summary_of_summaries_user_prompt(
     return (
         "Synthesize the following chunk summaries into the required metadata JSON.\n\n"
         f"Chunk summaries:\n{joined}"
+    )
+
+
+# =========================
+# STEP 2 — TRANSLATION
+# =========================
+
+def build_translation_system_prompt(previous_tail: str) -> str:
+    return (
+        "You are a professional book translator. "
+        'Return STRICT JSON only: {"chapter": "...", "translation": "..."}.\n'
+        "No markdown. No commentary.\n\n"
+        f"Previous translation tail (last 300 chars):\n{previous_tail}"
+    )
+
+
+def build_translation_user_prompt(
+    chunk_text: str,
+    target_language: str,
+    current_chapter: Optional[str],
+    context: Optional[Dict[str, Any]] = None,
+) -> str:
+    ctx_block = f"Optional context: {context}\n" if context else ""
+    return (
+        f"{ctx_block}Target language: {target_language}\n"
+        f"Current chapter (from previous chunk, may overwrite if new chapter begins): {current_chapter}\n\n"
+        "Chunk text:\n"
+        f"{chunk_text}\n\n"
+        "Output JSON only."
     )
