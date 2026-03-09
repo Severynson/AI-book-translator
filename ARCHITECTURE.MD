@@ -61,6 +61,11 @@ For each chunk, app asks LLM to respond with **JSON only**:
 **Translation continuity rule (short context):**
 - System prompt includes the **last 300 characters** of the **previous translation** so that translation style and context continue smoothly across chunks.
 
+**Secondary language preservation rule:**
+- If the metadata `"language"` array contains more than one element, the translation prompt instructs the LLM to **preserve secondary-language phrases as-is**.
+- Example: `"contra spem spero"` (Latin) should not be translated if Latin is a secondary language — the original author intentionally left it untranslated.
+- Only the primary language text is translated into the target language.
+
 **No extra text rule:**
 - LLM must output JSON only.
 - The `"translation"` field must contain only translated text, without disclaimers, introductions, or summaries.
@@ -84,6 +89,10 @@ Behavior:
 Options:
 - Upload PDF/TXT
 - Paste text
+
+**OCR controls** (visible when "Upload PDF/TXT" is selected):
+- Checkbox: **"Use OCR (for scanned PDFs)"** — toggles between text extraction (default) and OCR
+- Text input: **OCR languages** — Tesseract language codes, primary first (e.g., `ukr+eng`)
 
 Behavior:
 - After input is provided → proceed to metadata generation page
@@ -139,9 +148,17 @@ A unified interface so UI/business logic never cares whether it’s OpenAI-hoste
   - configurable `base_url` for local endpoints (OpenAI-compatible)
 
 ### 4.2 Document ingestion
-- PDF extraction (PDF → text)
+- **PDF text extraction** (PDF → text via `pypdf`)
+- **PDF OCR extraction** (PDF → images via `pdf2image` → text via `pytesseract`/Tesseract OCR)
 - TXT reading
 - direct pasted text
+
+**OCR mode** (user-selectable on Page 2):
+- Uses **Tesseract OCR** with configurable language codes (e.g., `ukr+eng`)
+- Primary language listed first, secondary language(s) after `+`
+- Tesseract uses language priors, preferring the primary alphabet when selected
+- Requires system dependency: `tesseract` (e.g., `brew install tesseract` on macOS) and language data files
+- Requires system dependency: `poppler` (e.g., `brew install poppler` on macOS) for PDF-to-image conversion
 
 Output:
 - `raw_text: str`
@@ -158,8 +175,9 @@ Two primary prompt “families”:
 - output: strict JSON with required keys and `"not provided"` defaults
 
 #### Translation prompt (Step 2)
-- input: current chunk + optional metadata context + current chapter + last-300 previous translation
+- input: current chunk + optional metadata context (including language array) + current chapter + last-300 previous translation
 - output: strict JSON with `"chapter"` + `"translation"`
+- if secondary languages are detected in metadata, includes a rule to preserve them untranslated
 
 ### 4.5 State management (pause/resume)
 A serializable state object stored to disk (e.g., JSON file) containing:
@@ -179,10 +197,16 @@ A serializable state object stored to disk (e.g., JSON file) containing:
 Required keys:
 - `author(s)` : string | array[string] | `"not provided"`
 - `title` : string | `"not provided"`
-- `language` : string | `"not provided"`
+- `language` : array[string] | `["not provided"]` — **ordered by frequency** (primary language first, secondary languages after)
 - `summary` : string | `"not provided"`
-- `chapters` : object<string, string> | `"not provided"`
+- `chapters` : object<string, object> | `{}` — each value has `"general"` and `"detailed"` keys
 - `target_language` : string (added by the app after Step 1)
+
+**Language array convention:**
+- First element = **primary language** (the language to translate FROM)
+- Subsequent elements = **secondary languages** (appear in titles, quotations, epigraphs, proper nouns — intentionally untranslated by the original author)
+- Example: `["Ukrainian", "English", "Latin"]`
+- The LLM is instructed to infer this from the document text
 
 ### 5.2 Translation JSON schema (Step 2)
 ```json
@@ -254,6 +278,7 @@ ai-book-translator/
           json_parser.py
         io/
           pdf_reader.py
+          ocr_pdf_reader.py
           text_reader.py
         persistence/
           state_store.py

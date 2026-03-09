@@ -3,7 +3,7 @@ name = "ai-book-translator"
 version = "0.1.0"
 description = "AI book translator with upload-first metadata + chunked fallback"
 requires-python = ">=3.10"
-dependencies = ["requests>=2.31.0", "pypdf", "reportlab"]
+dependencies = ["requests>=2.31.0", "pypdf", "reportlab", "pytesseract>=0.3.10", "pdf2image>=1.16.3", "Pillow>=10.0.0"]
 
 [tool.pytest.ini_options]
 markers = [

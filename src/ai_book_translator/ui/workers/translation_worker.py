@@ -73,7 +73,11 @@ class TranslationWorker(QThread):
         lines: List[str] = []
         lines.append(f"Title: {meta.get('title', 'not provided')}")
         lines.append(f"Author(s): {meta.get('author(s)', 'not provided')}")
-        lines.append(f"Source language: {meta.get('language', 'not provided')}")
+        lang = meta.get('language', ['not provided'])
+        if isinstance(lang, list):
+            lines.append(f"Source language(s): {', '.join(lang)}")
+        else:
+            lines.append(f"Source language(s): {lang}")
         lines.append(f"Translated to: {target_language}")
         lines.append("")
         lines.append("=" * 80)
@@ -114,10 +118,18 @@ class TranslationWorker(QThread):
 
             # Use all available metadata as context
             opt_ctx: Dict[str, Any] = {}
-            for k in ["author(s)", "title", "summary", "chapters"]:
+            for k in ["author(s)", "title", "summary", "chapters", "language"]:
                 val = meta.get(k)
                 if val and val != "not provided":
                     opt_ctx[k] = val
+
+            # Extract source languages for secondary language handling
+            source_languages: Optional[List[str]] = None
+            raw_lang = meta.get("language")
+            if isinstance(raw_lang, list) and raw_lang and raw_lang != ["not provided"]:
+                source_languages = raw_lang
+            elif isinstance(raw_lang, str) and raw_lang != "not provided":
+                source_languages = [raw_lang]
 
             # Resume defaults
             start_index = 0
@@ -204,7 +216,7 @@ class TranslationWorker(QThread):
 
                     chunk = chunks[i]
 
-                    sys = build_translation_system_prompt(prev_tail)
+                    sys = build_translation_system_prompt(prev_tail, source_languages=source_languages)
                     usr = build_translation_user_prompt(
                         chunk_text=chunk,
                         target_language=self.target_language,

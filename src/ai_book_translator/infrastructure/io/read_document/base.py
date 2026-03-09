@@ -21,13 +21,23 @@ class ReadDocument(ABC):
         raise NotImplementedError
 
     @classmethod
-    def from_path(cls, path: str | Path) -> "ReadDocument":
+    def from_path(
+        cls,
+        path: str | Path,
+        *,
+        use_ocr: bool = False,
+        ocr_languages: str = "",
+    ) -> "ReadDocument":
         """
         Factory method (Pythonic replacement for ReaderFactory).
-        Chooses correct reader based on file extension.
+        Chooses correct reader based on file extension and OCR flag.
         """
         from .pdf_reader import PdfReader
         from .text_reader import TextReader
+        from .ocr_pdf_reader import OcrPdfReader
+
+        if use_ocr and PdfReader.supports(path):
+            return OcrPdfReader(languages=ocr_languages)
 
         readers = [PdfReader, TextReader]
 

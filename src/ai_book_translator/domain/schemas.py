@@ -19,8 +19,12 @@ def validate_metadata_json(obj: Dict[str, Any]) -> None:
         raise SchemaValidationError('"author(s)" must be a string')
     if not isinstance(obj.get("title"), str):
         raise SchemaValidationError('"title" must be a string')
-    if not isinstance(obj.get("language"), str):
-        raise SchemaValidationError('"language" must be a string')
+    lang = obj.get("language")
+    if not isinstance(lang, list):
+        raise SchemaValidationError('"language" must be an array of strings')
+    for item in lang:
+        if not isinstance(item, str):
+            raise SchemaValidationError('"language" array must contain only strings')
     if not isinstance(obj.get("summary"), str):
         raise SchemaValidationError('"summary" must be a string')
     if not isinstance(obj.get("chapters"), dict):
@@ -44,12 +48,31 @@ def validate_metadata_json(obj: Dict[str, Any]) -> None:
 
 def normalize_not_provided(obj: Dict[str, Any]) -> Dict[str, Any]:
     # Normalize missing / empty strings to "not provided"
+    # (skip "language" — handled separately as an array)
     for k in REQUIRED_KEYS:
+        if k == "language":
+            continue
         v = obj.get(k)
         if v is None:
             obj[k] = "not provided"
         elif isinstance(v, str) and not v.strip():
             obj[k] = "not provided"
+
+    # Normalize language: ensure it is a list of strings
+    lang = obj.get("language")
+    if lang is None or (isinstance(lang, str) and not lang.strip()):
+        obj["language"] = ["not provided"]
+    elif isinstance(lang, str):
+        # Legacy string format → single-element list
+        obj["language"] = [lang]
+    elif isinstance(lang, list):
+        if not lang:
+            obj["language"] = ["not provided"]
+        else:
+            # Ensure all items are strings
+            obj["language"] = [str(item) for item in lang if str(item).strip()]
+            if not obj["language"]:
+                obj["language"] = ["not provided"]
 
     # Normalize author(s): list -> comma-separated string
     a = obj.get("author(s)")
