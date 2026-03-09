@@ -63,7 +63,7 @@ pip install requests>=2.31.0 pypdf reportlab pytesseract>=0.3.10 pdf2image>=1.16
 
 ### 4. Run the Application
 ```bash
-python -m ai_book_translator.ui.main
+python src/ai_book_translator/main.py
 ```
 
 ---
