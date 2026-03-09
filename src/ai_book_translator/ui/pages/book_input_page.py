@@ -5,7 +5,7 @@ from pathlib import Path
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QPushButton, QHBoxLayout, QFileDialog,
-    QTextEdit, QRadioButton, QButtonGroup, QGroupBox
+    QTextEdit, QRadioButton, QButtonGroup, QGroupBox, QCheckBox, QLineEdit,
 )
 
 from ai_book_translator.domain.models import DocumentInput
@@ -40,9 +40,22 @@ class BookInputPage(QWidget):
         self.btn_choose.clicked.connect(self._choose_file)
         self.lbl_file = QLabel("No file selected")
         self.lbl_file.setStyleSheet("color: #666;")
+
+        self.chk_ocr = QCheckBox("Use OCR (for scanned PDFs)")
+        self.chk_ocr.setChecked(False)
+        self.chk_ocr.toggled.connect(self._sync_ocr)
+
+        self.lbl_ocr_lang = QLabel("OCR languages (Tesseract codes, primary first):")
+        self.ocr_lang_input = QLineEdit()
+        self.ocr_lang_input.setPlaceholderText("e.g. ukr+eng")
+        self.ocr_lang_input.setText("eng")
+
         fb = QVBoxLayout()
         fb.addWidget(self.btn_choose)
         fb.addWidget(self.lbl_file)
+        fb.addWidget(self.chk_ocr)
+        fb.addWidget(self.lbl_ocr_lang)
+        fb.addWidget(self.ocr_lang_input)
         file_box.setLayout(fb)
 
         paste_box = QGroupBox("Paste text")
@@ -80,6 +93,13 @@ class BookInputPage(QWidget):
         use_file = self.radio_file.isChecked()
         self.btn_choose.setEnabled(use_file)
         self.txt.setEnabled(not use_file)
+        self.chk_ocr.setEnabled(use_file)
+        self._sync_ocr()
+
+    def _sync_ocr(self) -> None:
+        ocr_visible = self.radio_file.isChecked() and self.chk_ocr.isChecked()
+        self.lbl_ocr_lang.setVisible(ocr_visible)
+        self.ocr_lang_input.setVisible(ocr_visible)
 
     def _choose_file(self) -> None:
         self.banner.hide()
@@ -95,7 +115,14 @@ class BookInputPage(QWidget):
             if not self._selected_path:
                 self.banner.show_error("Please choose a PDF or TXT file.")
                 return
-            self._on_next(DocumentInput(file_path=self._selected_path, raw_text=None))
+            use_ocr = self.chk_ocr.isChecked()
+            ocr_languages = self.ocr_lang_input.text().strip() if use_ocr else ""
+            self._on_next(DocumentInput(
+                file_path=self._selected_path,
+                raw_text=None,
+                use_ocr=use_ocr,
+                ocr_languages=ocr_languages,
+            ))
         else:
             text = self.txt.toPlainText().strip()
             if not text:

@@ -46,8 +46,17 @@ class MetadataWorker(QThread):
             doc = self.document
             if doc.raw_text is None and doc.file_path and ReadDocument is not None:
                 try:
-                    txt = ReadDocument.from_path(doc.file_path).read(doc.file_path)
-                    doc = DocumentInput(file_path=doc.file_path, raw_text=txt)
+                    txt = ReadDocument.from_path(
+                        doc.file_path,
+                        use_ocr=doc.use_ocr,
+                        ocr_languages=doc.ocr_languages,
+                    ).read(doc.file_path)
+                    doc = DocumentInput(
+                        file_path=doc.file_path,
+                        raw_text=txt,
+                        use_ocr=doc.use_ocr,
+                        ocr_languages=doc.ocr_languages,
+                    )
                 except Exception:
                     doc = self.document
 

@@ -82,7 +82,10 @@ class MetadataService:
             "properties": {
                 "author(s)": {"type": "string"},
                 "title": {"type": "string"},
-                "language": {"type": "string"},
+                "language": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
                 "summary": {"type": "string"},
                 "chapters": {
                     "type": "object",

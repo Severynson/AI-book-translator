@@ -128,8 +128,17 @@ class AppWindow(QMainWindow):
         # Ensure raw_text (for hashing)
         if doc.raw_text is None and doc.file_path and ReadDocument is not None:
             try:
-                raw = ReadDocument.from_path(doc.file_path).read(doc.file_path)
-                doc = DocumentInput(file_path=doc.file_path, raw_text=raw)
+                raw = ReadDocument.from_path(
+                    doc.file_path,
+                    use_ocr=doc.use_ocr,
+                    ocr_languages=doc.ocr_languages,
+                ).read(doc.file_path)
+                doc = DocumentInput(
+                    file_path=doc.file_path,
+                    raw_text=raw,
+                    use_ocr=doc.use_ocr,
+                    ocr_languages=doc.ocr_languages,
+                )
             except Exception:
                 # keep as-is; may still work via upload-first metadata
                 pass
