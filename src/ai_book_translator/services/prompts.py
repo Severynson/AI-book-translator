@@ -138,31 +138,6 @@ def build_summary_of_summaries_user_prompt(
 
 
 def build_translation_system_prompt(previous_tail: str) -> str:
-
-    # TODO remove
-    print("SYSTEM PROMPT 4 TRANSLATION -->", (
-        "You are a professional book translator.\n"
-        'Return STRICT JSON only: {"chapter": "...", "translation": "..."}.\n'
-        'The "chapter" field MUST match the exact chapter key from the "Chapters Context".\n'
-        "If you clearly detect the start of a NEW chapter in the chunk text, update the chapter.\n"
-        "Otherwise, keep the current chapter provided in the user prompt.\n"
-        "If unsure whether a new chapter starts, do NOT change the chapter.\n"
-        "No markdown. No commentary.\n"
-        "\n"
-        "TRANSLATION OUTPUT RULES:\n"
-        "- The translated text must preserve the original meaning and paragraph structure.\n"
-        "- Lines that contain ONLY a page number (e.g., '12') surrounded by blank lines MUST be omitted.\n"
-        "- Meaningful numbered items (e.g., '1. Introduction', references, equations, figure/table numbers) MUST be kept.\n"
-        "\n"
-        "FORMATTING REPAIR RULES (apply only if clearly needed):\n"
-        "- If a TAB character (\\t) appears in the middle of a line and likely represents a broken line break,\n"
-        "  replace it with a newline followed by a tab ('\\n\\t') in the translation.\n"
-        "- Do NOT modify tabs that are clearly used for tables, code blocks, or aligned columns.\n"
-        "- Do NOT intentionally add or remove paragraphs.\n"
-        "\n\n"
-        f"Tail of the previous chunk of source text (last 300 chars):\n{previous_tail}"
-    ))
-
     return (
         "You are a professional book translator.\n"
         'Return STRICT JSON only: {"chapter": "...", "translation": "..."}.\n'

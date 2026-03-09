@@ -212,6 +212,7 @@ class TranslationWorker(QThread):
                         context=opt_ctx,
                     )
 
+                    # TODO: ???
                     obj = chat_json_strict_with_repair(
                         provider=self.provider,
                         system_prompt=sys,

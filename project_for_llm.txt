@@ -1,0 +1,3985 @@
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./experiments/debug_generate_metadata.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+from ai_book_translator.config.settings import Settings
+from ai_book_translator.domain.models import DocumentInput
+from ai_book_translator.services.connection_service import ConnectionService
+from ai_book_translator.services.metadata_service import MetadataService
+
+from ai_book_translator.infrastructure.llm.openai_provider import OpenAIResponsesProvider
+from ai_book_translator.infrastructure.llm.local_provider import LocalOllamaProvider
+
+# If you already have the ReadDocument factory under infrastructure/io/read_document/,
+# use it to automatically extract raw_text for fallback.
+try:
+    from ai_book_translator.infrastructure.io.read_document.base import ReadDocument
+except Exception:
+    ReadDocument = None  # fallback: no auto-extraction
+
+
+def main() -> None:
+    load_dotenv()  # loads .env into os.environ
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pdf", required=True, help="Path to PDF file")
+    ap.add_argument("--target-language", required=True)
+
+    ap.add_argument("--provider", choices=["openai", "ollama"], default="openai")
+    ap.add_argument("--model", default=None)
+
+    ap.add_argument("--openai-key", default=None, help="Overrides OPENAI_API_KEY if provided")
+    ap.add_argument("--ollama-url", default=None, help="Overrides OLLAMA_BASE_URL if provided")
+
+    ap.add_argument("--force-chunked", action="store_true", help="Skip upload-first and do chunked fallback only")
+    args = ap.parse_args()
+
+    pdf_path = Path(args.pdf).expanduser().resolve()
+    if not pdf_path.exists():
+        raise SystemExit(f"PDF not found: {pdf_path}")
+
+    # Choose provider
+    if args.provider == "openai":
+        api_key = args.openai_key or os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise SystemExit("Missing OpenAI API key. Set OPENAI_API_KEY in .env or pass --openai-key.")
+        model = args.model or "gpt-5-nano"
+        provider = OpenAIResponsesProvider(api_key=api_key, model=model)
+    else:
+        base_url = args.ollama_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        model = args.model or os.getenv("OLLAMA_MODEL", "llama3.1")
+        provider = LocalOllamaProvider(base_url=base_url, model=model)
+
+    # Connection test
+    ConnectionService(provider).test()
+
+    # Prepare DocumentInput
+    raw_text = None
+    if ReadDocument is not None:
+        # raw_text is only needed for fallback; we pre-extract it for convenience.
+        try:
+            raw_text = ReadDocument.from_path(pdf_path).read(pdf_path)
+        except Exception as e:
+            print(f"[WARN] Could not extract raw_text from PDF for fallback: {e}")
+
+    doc = DocumentInput(file_path=str(pdf_path), raw_text=raw_text)
+
+    svc = MetadataService(provider, Settings())
+
+    if args.force_chunked:
+        # Force chunked fallback by removing file_path.
+        doc = DocumentInput(file_path=None, raw_text=raw_text)
+
+    res = svc.generate_metadata(doc, target_language=args.target_language)
+
+    print("\n=== RESULT ===")
+    print("strategy_used:", res.strategy_used)
+    if res.fallback_reason:
+        print("fallback_reason:", res.fallback_reason)
+
+    print(json.dumps(res.metadata, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./experiments/debug_hashing.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+from pathlib import Path
+from typing import Optional, Tuple
+
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def hash_text_utf8_ignore(text: str) -> str:
+    b = (text or "").encode("utf-8", errors="ignore")
+    return sha256_hex(b)
+
+
+def normalize_text_for_hash(text: str) -> str:
+    """
+    Normalization helps detect whether your PDF extraction is changing in minor ways
+    (line endings, trailing spaces, etc.) between runs.
+    """
+    s = text or ""
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    # Strip trailing whitespace per line
+    s = "\n".join(line.rstrip() for line in s.split("\n"))
+    # Collapse runs of >2 newlines to 2 newlines
+    while "\n\n\n" in s:
+        s = s.replace("\n\n\n", "\n\n")
+    return s.strip()
+
+
+def read_file_bytes(path: Path) -> bytes:
+    return path.read_bytes()
+
+
+def extract_text(path: Path) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Returns (raw_text, extractor_info).
+    extractor_info describes which extraction path was used.
+    """
+    try:
+        from ai_book_translator.infrastructure.io.read_document.base import ReadDocument
+    except Exception as e:
+        return None, f"ReadDocument import failed: {e}"
+
+    try:
+        reader = ReadDocument.from_path(path)
+        txt = reader.read(path)
+        return txt, f"ReadDocument.from_path -> {reader.__class__.__name__}"
+    except Exception as e:
+        return None, f"ReadDocument extraction failed: {e}"
+
+
+def try_import_translation_state_helpers():
+    """
+    Your codebase has had multiple variants of these modules.
+    This tries to import what exists and returns (state_dir, find_by_hash_fn).
+    """
+    # Variant A: ai_book_translator.infrastructure.persistence.translation_state
+    try:
+        from ai_book_translator.infrastructure.persistence.translation_state import (
+            _default_state_dir as ts_default_dir,
+            find_state_by_hash as ts_find_by_hash,
+        )
+        return ("translation_state", ts_default_dir(), ts_find_by_hash)
+    except Exception:
+        pass
+
+    # Variant B: ai_book_translator.infrastructure.persistence.state_store
+    try:
+        from ai_book_translator.infrastructure.persistence.state_store import (
+            state_dir as ss_state_dir,
+            find_translation_state_by_hash as ss_find_by_hash,
+        )
+        return ("state_store", ss_state_dir(), ss_find_by_hash)
+    except Exception:
+        pass
+
+    return (None, None, None)
+
+
+def try_import_metadata_cache_helpers():
+    """
+    Returns (cache_dir, find_by_hash_fn).
+    """
+    try:
+        from ai_book_translator.infrastructure.persistence.metadata_cache import (
+            _default_state_dir as mc_default_dir,
+            find_metadata_cache_by_hash as mc_find_by_hash,
+        )
+        return ("metadata_cache", mc_default_dir(), mc_find_by_hash)
+    except Exception:
+        pass
+    return (None, None, None)
+
+
+def list_dir(d: Optional[Path]) -> list[str]:
+    if not d or not d.exists():
+        return []
+    return [p.name for p in sorted(d.glob("*")) if p.is_file()]
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--path", type=str, required=True, help="Path to PDF/TXT file")
+    ap.add_argument(
+        "--show-sample",
+        action="store_true",
+        help="Print a short text sample + lengths (useful for debugging extraction)",
+    )
+    args = ap.parse_args()
+
+    path = Path(args.path).expanduser().resolve()
+    if not path.exists():
+        raise SystemExit(f"File not found: {path}")
+
+    print("=" * 90)
+    print("HASH DEBUG")
+    print("=" * 90)
+    print(f"Input path: {path}")
+    print(f"File size: {path.stat().st_size} bytes")
+
+    # 1) Hash file bytes (useful if you want stable hashing across PDF extraction differences)
+    file_bytes = read_file_bytes(path)
+    h_file_bytes = sha256_hex(file_bytes)
+    print("\n[1] File-bytes hash (sha256):")
+    print(f"  {h_file_bytes}  (prefix={h_file_bytes[:16]})")
+
+    # 2) Extract text via your existing pipeline
+    raw_text, extractor_info = extract_text(path)
+    print("\n[2] Text extraction:")
+    print(f"  extractor: {extractor_info}")
+    if raw_text is None:
+        print("  raw_text: <None>")
+        print("\n🚨 If raw_text is None, your AppWindow hashing code will NOT compute doc_hash,")
+        print("   so resume will never trigger, and it will re-generate metadata each run.")
+        return
+
+    print(f"  raw_text length: {len(raw_text)} chars")
+    print(f"  raw_text utf8 bytes: {len(raw_text.encode('utf-8', errors='ignore'))} bytes")
+
+    if args.show_sample:
+        sample = raw_text[:500].replace("\n", "\\n")
+        print(f"  raw_text sample[0:500]: {sample}")
+
+    # 3) Hash extracted text exactly like your current functions do
+    h_text_raw = hash_text_utf8_ignore(raw_text)
+    norm = normalize_text_for_hash(raw_text)
+    h_text_norm = hash_text_utf8_ignore(norm)
+
+    print("\n[3] Extracted-text hashes (sha256 of utf8(errors=ignore)):")
+    print(f"  RAW text hash:        {h_text_raw}  (prefix={h_text_raw[:16]})")
+    print(f"  NORMALIZED text hash: {h_text_norm}  (prefix={h_text_norm[:16]})")
+    if h_text_raw != h_text_norm:
+        print("  ⚠️ RAW != NORMALIZED → your extraction has lots of whitespace/newline noise.")
+        print("     If extraction changes between runs, RAW hash may differ run-to-run.")
+
+    # 4) Compare against your app’s two hash implementations (if both exist)
+    print("\n[4] Compare against in-code implementations:")
+    try:
+        # AppWindow-style helper
+        def _doc_hash_from_text(text: str) -> str:
+            b = (text or "").encode("utf-8", errors="ignore")
+            return hashlib.sha256(b).hexdigest()
+
+        print(f"  AppWindow _doc_hash_from_text(raw): { _doc_hash_from_text(raw_text)[:16] }…")
+        print(f"  AppWindow _doc_hash_from_text(norm): { _doc_hash_from_text(norm)[:16] }…")
+    except Exception as e:
+        print(f"  AppWindow hash emulation failed: {e}")
+
+    try:
+        from ai_book_translator.infrastructure.persistence.translation_state import compute_document_hash
+        print(f"  translation_state.compute_document_hash(raw): { compute_document_hash(raw_text)[:16] }…")
+        print(f"  translation_state.compute_document_hash(norm): { compute_document_hash(norm)[:16] }…")
+    except Exception as e:
+        print(f"  translation_state.compute_document_hash import failed: {e}")
+
+    # 5) Check where caches/states are stored + whether anything matches
+    print("\n[5] State/caches lookup:")
+
+    ts_name, ts_dir, ts_find = try_import_translation_state_helpers()
+    mc_name, mc_dir, mc_find = try_import_metadata_cache_helpers()
+
+    print(f"  Translation state module: {ts_name}")
+    print(f"  Translation state dir:    {ts_dir}")
+    if ts_dir:
+        print(f"  Files in translation state dir: {len(list_dir(ts_dir))}")
+        for fn in list_dir(ts_dir)[:10]:
+            print(f"    - {fn}")
+
+    print(f"\n  Metadata cache module:    {mc_name}")
+    print(f"  Metadata cache dir:       {mc_dir}")
+    if mc_dir:
+        print(f"  Files in metadata cache dir: {len(list_dir(mc_dir))}")
+        for fn in list_dir(mc_dir)[:10]:
+            print(f"    - {fn}")
+
+    # Try match using RAW hash
+    print("\n  Lookup attempts:")
+    if ts_find and ts_dir:
+        try:
+            found = ts_find(h_text_raw)
+            print(f"    translation_state.find_by_hash(RAW): {'FOUND' if found else 'not found'}")
+        except Exception as e:
+            print(f"    translation_state.find_by_hash(RAW) failed: {e}")
+
+        try:
+            found = ts_find(h_text_norm)
+            print(f"    translation_state.find_by_hash(NORM): {'FOUND' if found else 'not found'}")
+        except Exception as e:
+            print(f"    translation_state.find_by_hash(NORM) failed: {e}")
+
+    if mc_find and mc_dir:
+        try:
+            found = mc_find(h_text_raw)
+            print(f"    metadata_cache.find_by_hash(RAW): {'FOUND' if found else 'not found'}")
+        except Exception as e:
+            print(f"    metadata_cache.find_by_hash(RAW) failed: {e}")
+
+        try:
+            found = mc_find(h_text_norm)
+            print(f"    metadata_cache.find_by_hash(NORM): {'FOUND' if found else 'not found'}")
+        except Exception as e:
+            print(f"    metadata_cache.find_by_hash(NORM) failed: {e}")
+
+    print("\n" + "=" * 90)
+    print("INTERPRETATION QUICK GUIDE")
+    print("=" * 90)
+    print("If RAW hash changes between runs → your PDF text extraction is nondeterministic.")
+    print("  Fix: hash file BYTES (PDF bytes) OR normalize text more aggressively.")
+    print("")
+    print("If you see caches/states saved under a HOME directory → your persistence module still uses Path.home().")
+    print("  Fix: change those _default_state_dir() to project-local state/ (like we did in paths.py).")
+    print("")
+    print("If raw_text is None/empty → resume cannot work because you never compute a hash.")
+    print("  Fix: always extract raw_text in BookInputPage before deciding resume vs metadata.")
+    print("")
+    print("If state exists but not found → the app uses a DIFFERENT hash than the file you are hashing now.")
+    print("  Fix: ensure AppWindow and TranslationWorker use the same hash function + same input text.")
+    print("=" * 90)
+
+
+if __name__ == "__main__":
+    main()
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./experiments/debug_translate_ui.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+from PyQt5.QtWidgets import QApplication, QMainWindow
+
+from ai_book_translator.config.settings import Settings
+from ai_book_translator.domain.models import DocumentInput, MetadataResult
+from ai_book_translator.infrastructure.io.read_document.base import ReadDocument
+
+# Providers
+from ai_book_translator.infrastructure.llm.openai_provider import (
+    OpenAIResponsesProvider,
+)
+from ai_book_translator.infrastructure.llm.local_ollama_provider import (
+    LocalOllamaProvider,
+)
+
+# UI page
+from ai_book_translator.ui.pages.translate_page import TranslatePage
+
+
+def load_metadata(path: Path) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def make_provider(provider_name: str):
+    provider_name = provider_name.lower().strip()
+
+    if provider_name == "openai":
+        # Uses OPENAI_API_KEY from env by default
+        return OpenAIResponsesProvider(model="gpt-5-nano", timeout_sec=240)
+
+    if provider_name == "ollama":
+        # Uses OLLAMA_BASE_URL / OLLAMA_MODEL from env if you want; here keep explicit defaults
+        import os
+
+        base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        model = os.getenv("OLLAMA_MODEL", "llama3.1")
+        return LocalOllamaProvider(base_url=base_url, model=model, timeout_sec=240)
+
+    raise ValueError("provider must be one of: openai | ollama")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--provider", default="openai", help="openai | ollama")
+    ap.add_argument("--pdf", default="experiments/TissUnet paper Mandzak.pdf")
+    ap.add_argument("--meta", default="experiments/TissUnet.json")
+    ap.add_argument(
+        "--target-language",
+        default=None,
+        help="Overrides meta['target_language'] if provided",
+    )
+    ap.add_argument(
+        "--chunk-chars",
+        type=int,
+        default=None,
+        help="Overrides Settings.translation_chunk_chars",
+    )
+    args = ap.parse_args()
+
+    pdf_path = Path(args.pdf)
+    meta_path = Path(args.meta)
+
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+    if not meta_path.exists():
+        raise FileNotFoundError(f"Metadata JSON not found: {meta_path}")
+
+    # 1) Load metadata result
+    meta = load_metadata(meta_path)
+
+    # Decide target language
+    target_language = args.target_language or meta.get("target_language") or "Ukrainian"
+
+    metadata_result = MetadataResult(
+        metadata=meta,
+        strategy_used="debug",
+        fallback_reason=None,
+    )
+
+    # 2) Extract PDF text now (so TranslateWorker definitely has raw_text)
+    raw_text = ReadDocument.from_path(pdf_path).read(pdf_path)
+
+    document = DocumentInput(
+        file_path=str(pdf_path),
+        raw_text=raw_text,
+        filename_hint=pdf_path.name,
+    )
+
+    # 3) Provider + Settings
+    provider = make_provider(args.provider)
+
+    settings = Settings()
+    if args.chunk_chars is not None:
+        # Settings is frozen in your project, so recreate with an override
+        settings = Settings(
+            upload_retries=settings.upload_retries,
+            json_repair_retries=settings.json_repair_retries,
+            translation_chunk_chars=args.chunk_chars,
+            local_metadata_chunk_chars=settings.local_metadata_chunk_chars,
+            local_metadata_first_chunks_with_title_author_hint=settings.local_metadata_first_chunks_with_title_author_hint,
+            max_chunk_summaries_for_summary_of_summaries=settings.max_chunk_summaries_for_summary_of_summaries,
+        )
+
+    # 4) Start UI directly on TranslatePage
+    app = QApplication([])
+
+    win = QMainWindow()
+    win.setWindowTitle("AI-book-translator — DEBUG Translate")
+    win.resize(980, 720)
+
+    page = TranslatePage(on_back=lambda: None)
+    win.setCentralWidget(page)
+    win.show()
+
+    # Start translation immediately
+    page.start(
+        provider=provider,
+        settings=settings,
+        document=document,
+        metadata_result=metadata_result,
+        target_language=target_language,
+    )
+
+    app.exec_()
+
+
+if __name__ == "__main__":
+    main()
+
+# OpenAI (uses OPENAI_API_KEY)
+# python3 debug_translate_ui.py --provider openai
+# Ollama (uses OLLAMA_BASE_URL + OLLAMA_MODEL)
+# python3 debug_translate_ui.py --provider ollama
+# Override chunk size (e.g. 6000 chars per request)
+# python3 debug_translate_ui.py --provider openai --chunk-chars 6000
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./experiments/s.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+str = """
+die Seele in Mitleidenschaft zu ziehen vermag; denn Seele und Korper sind nichts Getrenntes, vielmehr ein und dasselbe Leben. So gibt es selten eine korperliche Krankheit, die nicht seelisch kompliziert ist, auch wenn sie nicht psychisch verursacht ist.
+Es ware aber unrichtig, wenn wir nur die ungunstige Seite des Un­ bewuflten hervorheben wiirden. In allen gewohnlichen Fallen ist das Unbewuflte nur darum ungunstig oder gefahrlich, weil wir uneins da­ mit und daher im Gegensatz dazu sind. Die negative Einstellung zum Unbewuflten, resp. die Abspaltung desselben, ist insofern nachteilig, als dessen Dynamik mit der E11ergie der Imti11kte identisch ist 1. Unver­ bundenheit mit dem Unbewuflten bedeutet soviel wie Instinkt- und Wurzellosigkeit.
+Wenn es gelingt, jene Funktion herzustellen, die ich als transzen­ dente bezeichne, so ist das Uneinssein aufgehoben, und man kann sich dann der giinstigen Seite des Unbewuflten erfreuen. Dann gibt namlich das Unbewuflte alle jene FOrderung und Hilfe, welche eine gutige Na­ tur in iiberquellender Fiille dem Menschen vermitteln kann. Es hat ja Moglichkeiten, die dem Bewufltsein verschlossen sind; denn es verfogt iiber alle unterschwelligen (subliminalen) psychisd1en Inhalte, iiber all das Vergessene und Dbersehene und zudem iiber die Weisheit der Erfahrung ungezahlter Jahrtausende, die in seinen archetypischen Strukturen niedergelegt ist.
+Das Unbewuflte ist bestandig tatig und schafft Kombinationen seiner Materialien, die der Bestimmung der Zukunft dienen. Es produziert subliminale, prospektive Kombinationen, so gut wie unser Bewufltsein; nur sind sie den bewuflten Kombinationen an Feinheit und Reichweite bedeutend iiberlegen. Das Unbewuflte kann daher ein Fuhrer sonder­ gleichen for den Menschen sein, wenn dieser der Verfohrung stand­ zuhalten vermag.
+Die praktische Behandlung richtet sich nach dem erreichten thera­ peutischen Resultat. Das Resultat kann sozusagen auf jeder Stufe der Behandlung eintreten, ganz unabhangig von der Schwere oder Dauer des Leidens. Und umgekehrt kann die Behandlung eines schweren Falles sehr lange dauern, ohne dafl hohere Stufen der Entwicklung er-
+1. Vgl. lnstinkt und Unbewuf3tes in Uber psychische Ene.·getik und das )/Yesen der Triiwne, 1948. p. 261 ff. Ges. Werke, Bd. 8.
+"""
+
+print(len(str))
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/__init__.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+__all__ = []
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/config/__init__.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/config/settings.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Settings:
+    upload_retries: int = 2
+    json_repair_retries: int = 2
+
+    translation_chunk_chars: int = 30000
+    local_metadata_chunk_chars: int = 8000
+    local_metadata_first_chunks_with_title_author_hint: int = 3
+
+    max_chunk_summaries_for_summary_of_summaries: int = 500
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/domain/__init__.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/domain/models.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+
+MetadataJSON = Dict[str, Any]
+
+@dataclass
+class DocumentInput:
+    file_path: Optional[str] = None     # to attempt upload-first
+    raw_text: Optional[str] = None      # required for chunked fallback
+    filename_hint: Optional[str] = None
+
+@dataclass
+class MetadataResult:
+    metadata: MetadataJSON
+    strategy_used: str  # "upload" | "chunked"
+    fallback_reason: Optional[str] = None
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/domain/schemas.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+from typing import Any, Dict
+from ..infrastructure.llm.exceptions import SchemaValidationError
+
+REQUIRED_KEYS = ["author(s)", "title", "language", "summary", "chapters"]
+
+
+def validate_metadata_json(obj: Dict[str, Any]) -> None:
+    missing = [k for k in REQUIRED_KEYS if k not in obj]
+    if missing:
+        raise SchemaValidationError(f"Metadata JSON missing keys: {missing}")
+
+    extra = [k for k in obj.keys() if k not in REQUIRED_KEYS and k != "target_language"]
+    if extra:
+        raise SchemaValidationError(f"Metadata JSON has extra keys: {extra}")
+
+    # Type checks (optional but recommended)
+    if not isinstance(obj.get("author(s)"), str):
+        raise SchemaValidationError('"author(s)" must be a string')
+    if not isinstance(obj.get("title"), str):
+        raise SchemaValidationError('"title" must be a string')
+    if not isinstance(obj.get("language"), str):
+        raise SchemaValidationError('"language" must be a string')
+    if not isinstance(obj.get("summary"), str):
+        raise SchemaValidationError('"summary" must be a string')
+    if not isinstance(obj.get("chapters"), dict):
+        raise SchemaValidationError('"chapters" must be an object/dict')
+
+    # Ensure chapters values are correct structure
+    for k, v in obj["chapters"].items():
+        if not isinstance(k, str):
+            raise SchemaValidationError('"chapters" keys must be strings')
+        
+        # New structure check
+        if not isinstance(v, dict):
+             raise SchemaValidationError(f'"chapters" value for "{k}" must be an object with "general" and "detailed"')
+        
+        if "general" not in v or "detailed" not in v:
+             raise SchemaValidationError(f'"chapters" value for "{k}" missing "general" or "detailed"')
+        
+        if not isinstance(v.get("general"), str) or not isinstance(v.get("detailed"), str):
+             raise SchemaValidationError(f'"chapters" value for "{k}" must have string values for "general" and "detailed"')
+
+
+def normalize_not_provided(obj: Dict[str, Any]) -> Dict[str, Any]:
+    # Normalize missing / empty strings to "not provided"
+    for k in REQUIRED_KEYS:
+        v = obj.get(k)
+        if v is None:
+            obj[k] = "not provided"
+        elif isinstance(v, str) and not v.strip():
+            obj[k] = "not provided"
+
+    # Normalize author(s): list -> comma-separated string
+    a = obj.get("author(s)")
+    if isinstance(a, list):
+        joined = ", ".join(str(x).strip() for x in a if str(x).strip())
+        obj["author(s)"] = joined or "not provided"
+    elif a is None:
+        obj["author(s)"] = "not provided"
+
+    # Normalize chapters: if model returned "not provided" string, convert to {}
+    ch = obj.get("chapters")
+    if isinstance(ch, str):
+        if ch.strip().lower() == "not provided":
+            obj["chapters"] = {}
+    elif ch is None:
+        obj["chapters"] = {}
+
+    return obj
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/infrastructure/io/__init__.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/infrastructure/io/read_document/__init__.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/infrastructure/io/read_document/base.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from pathlib import Path
+
+
+class ReadDocument(ABC):
+    """
+    Abstract document reader.
+    """
+
+    @abstractmethod
+    def read(self, path: str | Path) -> str:
+        """Read document and return extracted text."""
+        raise NotImplementedError
+
+    @classmethod
+    @abstractmethod
+    def supports(cls, path: str | Path) -> bool:
+        """Return True if this reader supports the given file."""
+        raise NotImplementedError
+
+    @classmethod
+    def from_path(cls, path: str | Path) -> "ReadDocument":
+        """
+        Factory method (Pythonic replacement for ReaderFactory).
+        Chooses correct reader based on file extension.
+        """
+        from .pdf_reader import PdfReader
+        from .text_reader import TextReader
+
+        readers = [PdfReader, TextReader]
+
+        for reader_cls in readers:
+            if reader_cls.supports(path):
+                return reader_cls()
+
+        raise ValueError(f"No document reader for file: {path}")
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/infrastructure/io/read_document/pdf_reader.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+
+from pathlib import Path
+from pypdf import PdfReader as PyPdfReader
+
+from .base import ReadDocument
+
+
+class PdfReader(ReadDocument):
+    @classmethod
+    def supports(cls, path: str | Path) -> bool:
+        return Path(path).suffix.lower() == ".pdf"
+
+    def read(self, path: str | Path) -> str:
+        p = Path(path)
+
+        try:
+            reader = PyPdfReader(p)
+            text_parts: list[str] = []
+
+            for page in reader.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text_parts.append(page_text)
+
+            return "\n".join(text_parts)
+
+        except FileNotFoundError:
+            raise RuntimeError(f"PDF file not found: {p}")
+        except Exception as e:
+            raise RuntimeError(f"Error reading PDF {p}: {e}") from e
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/infrastructure/io/read_document/text_reader.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from .base import ReadDocument
+
+
+class TextReader(ReadDocument):
+    @classmethod
+    def supports(cls, path: str | Path) -> bool:
+        return Path(path).suffix.lower() == ".txt"
+
+    def read(self, path: str | Path) -> str:
+        p = Path(path)
+        try:
+            return p.read_text(encoding="utf-8", errors="ignore")
+        except Exception as e:
+            raise RuntimeError(f"Failed to read TXT file {p}: {e}") from e
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/infrastructure/llm/__init__.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/infrastructure/llm/base.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+from abc import ABC, abstractmethod
+from typing import Any, Dict
+from .exceptions import UploadNotSupportedError
+
+
+class LLMProvider(ABC):
+    @abstractmethod
+    def test_connection(self) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def chat_text(self, system_prompt: str, user_prompt: str, **kwargs: Any) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    def chat_text_with_document(
+        self, system_prompt: str, user_prompt: str, file_path: str, **kwargs: Any
+    ) -> str:
+        raise UploadNotSupportedError("This provider does not support document upload.")
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/infrastructure/llm/exceptions.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+class LLMError(Exception):
+    """Base class for all LLM-related errors."""
+    pass
+
+class LLMTransientError(LLMError):
+    """Temporary errors (timeouts, rate limits, 5xx). Retry recommended."""
+    pass
+
+class LLMConfigurationError(LLMError):
+    """Invalid API key, bad model name, or misconfiguration. Do not retry."""
+    pass
+
+class LLMRefusalError(LLMError):
+    """Model refused to generate content (safety filter, policy violation)."""
+    pass
+
+class LLMParsingError(LLMError):
+    """Model output could not be parsed (e.g. invalid JSON)."""
+    pass
+
+class UploadNotSupportedError(LLMError):
+    """Provider does not support document upload."""
+    pass
+
+class UploadFailedError(LLMError):
+    """Document upload failed."""
+    pass
+
+class DocumentReadError(LLMError):
+    """Failed to read document content."""
+    pass
+
+class SchemaValidationError(LLMError):
+    """Metadata does not match required schema."""
+    pass
+
+# Alias for backward compatibility if needed, or deprecate
+TransientLLMError = LLMTransientError
+InvalidJSONError = LLMParsingError
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/infrastructure/llm/json_parser.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+import json
+from typing import Any, Dict, Optional
+from .exceptions import InvalidJSONError
+
+def parse_json_strict(text: str) -> Dict[str, Any]:
+    text = (text or "").strip()
+    try:
+        obj = json.loads(text)
+    except Exception as e:
+        raise InvalidJSONError(f"Failed to parse JSON: {e}") from e
+    if not isinstance(obj, dict):
+        raise InvalidJSONError("Top-level JSON must be an object/dict.")
+    return obj
+
+def extract_json_object_loose(text: str) -> Optional[str]:
+    if not text:
+        return None
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    return text[start:end+1]
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/infrastructure/llm/local_provider.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+
+from typing import Any, Dict
+import requests
+
+from .base import LLMProvider
+from .exceptions import LLMError, UploadNotSupportedError, TransientLLMError
+
+
+class LocalOllamaProvider(LLMProvider):
+    """
+    Local provider for an OpenAI-compatible Ollama server.
+
+    Expected endpoint:
+      - POST {base_url}/v1/chat/completions
+    """
+
+    def __init__(self, base_url: str, model: str, timeout_sec: int = 240):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.timeout_sec = timeout_sec
+
+    def test_connection(self) -> None:
+        _ = self.chat_text(
+            system_prompt="You are a helpful assistant.",
+            user_prompt="Reply with exactly: OK",
+            max_tokens=64,
+        )
+
+    def chat_text(self, system_prompt: str, user_prompt: str, **kwargs: Any) -> str:
+        url = f"{self.base_url}/v1/chat/completions"
+
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+
+        # Some OpenAI-like fields may not be supported; pass through but keep safe defaults
+        payload.update(kwargs)
+
+        try:
+            r = requests.post(url, json=payload, timeout=self.timeout_sec)
+        except requests.Timeout as e:
+            raise TransientLLMError(f"Timeout calling {url}") from e
+        except requests.RequestException as e:
+            raise TransientLLMError(f"Network error calling {url}: {e}") from e
+
+        if r.status_code in (429, 500, 502, 503, 504):
+            raise TransientLLMError(f"Transient error {r.status_code}: {r.text[:500]}")
+        if r.status_code >= 400:
+            raise LLMError(f"HTTP {r.status_code}: {r.text[:1200]}")
+
+        data = r.json()
+        try:
+            return data["choices"][0]["message"]["content"]
+        except Exception as e:
+            raise LLMError(f"Unexpected response shape: {data}") from e
+
+    def chat_text_with_document(
+        self, system_prompt: str, user_prompt: str, file_path: str, **kwargs: Any
+    ) -> str:
+        raise UploadNotSupportedError(
+            "Local provider does not support document upload."
+        )
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/infrastructure/llm/openai_provider.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+import os
+from typing import Any, Dict, Optional, List, Tuple
+import requests
+import time
+import random
+from .base import LLMProvider
+from .exceptions import (
+    LLMError,
+    UploadNotSupportedError,
+    UploadFailedError,
+    TransientLLMError,
+)
+
+
+class OpenAIResponsesProvider(LLMProvider):
+    """
+    OpenAI provider using the Responses API.
+
+    - text: POST https://api.openai.com/v1/responses
+    - file upload: POST https://api.openai.com/v1/files (purpose=user_data recommended for model inputs)
+
+    Default model: gpt-5-nano
+    """
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: str = "gpt-5-nano",
+        base_url: str = "https://api.openai.com",
+        timeout_sec: int = 1000,
+    ):
+        if api_key is None:
+            api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "Missing OpenAI API key. Pass api_key=... or set OPENAI_API_KEY."
+            )
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.api_key = api_key
+        self.timeout_sec = timeout_sec
+
+    def _headers_json(self) -> Dict[str, str]:
+        return {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+
+    def _headers_multipart(self) -> Dict[str, str]:
+        # IMPORTANT: no Content-Type; requests will set multipart boundary.
+        return {"Authorization": f"Bearer {self.api_key}"}
+
+    def test_connection(self) -> None:
+        _ = self.chat_text(
+            system_prompt="You are a helpful assistant.",
+            user_prompt="Reply with exactly: OK",
+            max_output_tokens=512,
+        )
+
+    # ---------- Core helpers ----------
+
+    def _post_json(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        # Try a few times on timeouts / transient codes
+        max_attempts = 4
+        base_sleep = 1.0
+
+        last_err: Exception | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                r = requests.post(
+                    url,
+                    headers=self._headers_json(),
+                    json=payload,
+                    timeout=self.timeout_sec,  # consider 180–300 for big docs
+                )
+            except requests.Timeout as e:
+                last_err = e
+                # backoff
+                sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
+                time.sleep(sleep_s)
+                continue
+            except requests.RequestException as e:
+                last_err = e
+                sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
+                time.sleep(sleep_s)
+                continue
+
+            # transient http statuses
+            if r.status_code in (429, 500, 502, 503, 504):
+                last_err = TransientLLMError(
+                    f"Transient error {r.status_code}: {r.text[:500]}"
+                )
+                sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
+                time.sleep(sleep_s)
+                continue
+
+            if r.status_code >= 400:
+                raise LLMError(f"HTTP {r.status_code}: {r.text[:1200]}")
+
+            return r.json()
+
+        raise TransientLLMError(f"Timeout/Network failure calling {url}") from last_err
+
+    def _extract_output_text(self, resp: Dict[str, Any]) -> str:
+        """
+        Robustly extract assistant text from Responses API response.
+        The API returns an `output` array of items; we gather text chunks.
+        """
+        out_items = resp.get("output", []) or []
+        parts: List[str] = []
+
+        for item in out_items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "message":
+                continue
+            content = item.get("content", []) or []
+            # content elements typically look like:
+            # { "type": "output_text", "text": "..." }
+            for c in content:
+                if not isinstance(c, dict):
+                    continue
+                ctype = c.get("type")
+                if ctype in ("output_text", "text"):
+                    txt = c.get("text")
+                    if isinstance(txt, str) and txt:
+                        parts.append(txt)
+
+        return "".join(parts).strip()
+
+    # ---------- Public API ----------
+
+    def chat_text(self, system_prompt: str, user_prompt: str, **kwargs: Any) -> str:
+        url = f"{self.base_url}/v1/responses"
+
+        # Responses API accepts either a string input or an array of message-like items.
+        # We'll use the array form so you can pass system + user cleanly.
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "input": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+
+        # Map common kwargs (keep your call sites similar)
+        # Responses API uses max_output_tokens (not max_tokens).
+        if "max_tokens" in kwargs and "max_output_tokens" not in kwargs:
+            kwargs["max_output_tokens"] = kwargs.pop("max_tokens")
+
+        text = kwargs.pop("text", None)
+        if text is not None:
+            payload["text"] = text
+
+        payload.update(kwargs)
+
+        resp = self._post_json(url, payload)
+        # self._raise_if_incomplete(resp, url=url)
+        text = self._extract_output_text(resp)
+        if not text:
+            raise LLMError(
+                f"Empty output_text from Responses API. Raw response: {resp}"
+            )
+        return text
+
+    def chat_text_with_document(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        file_path: str,
+        **kwargs: Any,
+    ) -> str:
+        """
+        Upload file via Files API, then reference it in the Responses input using input_file + file_id.
+
+        If OpenAI rejects the file as an input for the chosen model/type,
+        we map that to UploadNotSupportedError so your fallback chunking can run.
+        """
+        file_id = self._upload_file_user_data(file_path)
+
+        url = f"{self.base_url}/v1/responses"
+
+        # Build input: user message contains both the file and the question/instructions.
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "input": [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_file", "file_id": file_id},
+                        {"type": "input_text", "text": user_prompt},
+                    ],
+                },
+            ],
+        }
+
+        if "max_tokens" in kwargs and "max_output_tokens" not in kwargs:
+            kwargs["max_output_tokens"] = kwargs.pop("max_tokens")
+
+        text = kwargs.pop("text", None)
+        if text is not None:
+            payload["text"] = text
+
+        payload.update(kwargs)
+
+        try:
+            resp = self._post_json(url, payload)
+            # self._raise_if_incomplete(resp, url=url)
+        except LLMError as e:
+            # If the model/endpoint refuses file input, treat as "not supported" for upload-first.
+            msg = str(e).lower()
+            if any(
+                s in msg
+                for s in [
+                    "input_file",
+                    "file_id",
+                    "unsupported",
+                    "invalid",
+                    "cannot",
+                    "not allowed",
+                ]
+            ):
+                raise UploadNotSupportedError(
+                    f"File input rejected by model/API: {e}"
+                ) from e
+            raise
+
+        text = self._extract_output_text(resp)
+        if not text:
+            raise UploadFailedError(
+                f"Empty output_text after file input. Raw response: {resp}"
+            )
+        return text
+
+    def x(self, resp: Dict[str, Any], *, url: str) -> None:
+        status = resp.get("status")
+        if status != "incomplete":
+            return
+
+        details = resp.get("incomplete_details") or {}
+        reason = details.get("reason") or "unknown"
+
+        # content_filter is NOT transient — retries usually won't help
+        if reason == "content_filter":
+            raise LLMError(
+                "OpenAI blocked this chunk (content_filter). "
+                "Try a smaller chunk size, or locate the offending chunk text. "
+                f"Raw incomplete_details: {details}"
+            )
+
+        # max_output_tokens is usually fixable by increasing the limit
+        if reason == "max_output_tokens":
+            raise LLMError(
+                "Response was cut off due to max_output_tokens. Increase max_output_tokens."
+            )
+
+        raise LLMError(
+            f"Responses API returned incomplete status: reason={reason}, details={details}, url={url}"
+        )
+
+    def _looks_like_unsupported_schema_error(msg: str) -> bool:
+        m = msg.lower()
+        needles = [
+            "json_schema",
+            "structured outputs",
+            "response format",
+            "text.format",
+            "unsupported",
+        ]
+        return any(n in m for n in needles)
+
+    # ---------- File upload ----------
+
+    def _upload_file_user_data(self, file_path: str) -> str:
+        files_url = f"{self.base_url}/v1/files"
+        try:
+            with open(file_path, "rb") as f:
+                files = {"file": (os.path.basename(file_path), f)}
+                data = {"purpose": "user_data"}  # recommended for model inputs
+                r = requests.post(
+                    files_url,
+                    headers=self._headers_multipart(),
+                    files=files,
+                    data=data,
+                    timeout=self.timeout_sec,
+                )
+        except FileNotFoundError as e:
+            raise UploadFailedError(f"File not found: {file_path}") from e
+        except requests.Timeout as e:
+            raise TransientLLMError(f"Timeout uploading to {files_url}") from e
+        except requests.RequestException as e:
+            raise TransientLLMError(
+                f"Network error uploading to {files_url}: {e}"
+            ) from e
+
+        if r.status_code in (429, 500, 502, 503, 504):
+            raise TransientLLMError(
+                f"Transient upload error {r.status_code}: {r.text[:500]}"
+            )
+        if r.status_code >= 400:
+            # If endpoint changed / blocked
+            if r.status_code in (404, 405):
+                raise UploadNotSupportedError(
+                    f"Files endpoint not available: HTTP {r.status_code}"
+                )
+            raise UploadFailedError(
+                f"Upload failed HTTP {r.status_code}: {r.text[:1200]}"
+            )
+
+        file_data = r.json()
+        file_id = file_data.get("id")
+        if not file_id:
+            raise UploadFailedError(
+                f"Upload succeeded but no file id returned: {file_data}"
+            )
+
+        return file_id
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/infrastructure/persistence/__init__.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/infrastructure/persistence/metadata_cache.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+
+import json
+import re
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+from .paths import state_dir
+
+def _default_state_dir() -> Path:
+    d = state_dir() / "metadata_cache"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _slugify(name: str, max_len: int = 80) -> str:
+    name = (name or "").strip()
+    if not name:
+        return "untitled"
+    name = re.sub(r"\s+", " ", name)
+    name = re.sub(r"[^a-zA-Z0-9 _\-\(\)\[\]\.]", "", name)
+    name = name.strip().replace(" ", "_")
+    return name[:max_len] or "untitled"
+
+
+@dataclass(frozen=True)
+class MetadataCacheRecord:
+    document_hash: str
+    target_language: str
+    metadata: Dict[str, Any]
+    created_at: float
+    title_hint: str
+
+
+def _cache_path_for(document_hash: str, title_hint: str, state_dir: Optional[Path] = None) -> Path:
+    d = state_dir or _default_state_dir()
+    slug = _slugify(title_hint) if title_hint else "metadata"
+    # Include hash so multiple “Untitled” docs don’t collide.
+    return d / f"{slug}.{document_hash}.metadata_cache.json"
+
+
+def save_metadata_cache(
+    *,
+    document_hash: str,
+    metadata: Dict[str, Any],
+    target_language: str,
+    title_hint: str = "",
+    state_dir: Optional[Path] = None,
+) -> Path:
+    rec = MetadataCacheRecord(
+        document_hash=document_hash,
+        target_language=target_language,
+        metadata=dict(metadata or {}),
+        created_at=time.time(),
+        title_hint=title_hint or "",
+    )
+    p = _cache_path_for(document_hash, title_hint=title_hint, state_dir=state_dir)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "document_hash": rec.document_hash,
+                "target_language": rec.target_language,
+                "metadata": rec.metadata,
+                "created_at": rec.created_at,
+                "title_hint": rec.title_hint,
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+    tmp.replace(p)
+    return p
+
+
+def find_metadata_cache_by_hash(
+    document_hash: str,
+    *,
+    state_dir: Optional[Path] = None,
+) -> Optional[Path]:
+    d = state_dir or _default_state_dir()
+    if not d.exists():
+        return None
+
+    # file name includes ".{hash}.metadata_cache.json"
+    suffix = f".{document_hash}.metadata_cache.json"
+    for p in d.glob(f"*{suffix}"):
+        if p.is_file():
+            return p
+    return None
+
+
+def load_metadata_cache(path: str | Path) -> MetadataCacheRecord:
+    p = Path(path)
+    with open(p, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+
+    return MetadataCacheRecord(
+        document_hash=str(obj.get("document_hash") or ""),
+        target_language=str(obj.get("target_language") or ""),
+        metadata=dict(obj.get("metadata") or {}),
+        created_at=float(obj.get("created_at") or 0.0),
+        title_hint=str(obj.get("title_hint") or ""),
+    )
+
+
+def delete_metadata_cache_for_hash(document_hash: str, *, state_dir: Optional[Path] = None) -> None:
+    d = state_dir or _default_state_dir()
+    suffix = f".{document_hash}.metadata_cache.json"
+    for p in d.glob(f"*{suffix}"):
+        try:
+            p.unlink()
+        except Exception:
+            pass
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/infrastructure/persistence/paths.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+from pathlib import Path
+
+
+def project_root() -> Path:
+    p = Path(__file__).resolve()
+    for parent in [p] + list(p.parents):
+        if (parent / "pyproject.toml").exists():
+            return parent
+    # fallback: cwd
+    return Path.cwd().resolve()
+
+
+def state_dir() -> Path:
+    d = project_root() / "state"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/infrastructure/persistence/state_store.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+from pathlib import Path
+import json
+from typing import Any, Dict, Optional
+
+from .paths import state_path_for_hash
+
+
+class StateStore:
+    def load(self, doc_hash: str) -> Optional[Dict[str, Any]]:
+        p = state_path_for_hash(doc_hash)
+        if not p.exists():
+            return None
+        return json.loads(p.read_text(encoding="utf-8"))
+
+    def save(self, doc_hash: str, state: Dict[str, Any]) -> None:
+        p = state_path_for_hash(doc_hash)
+        p.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def delete(self, doc_hash: str) -> None:
+        p = state_path_for_hash(doc_hash)
+        if p.exists():
+            p.unlink()
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/infrastructure/persistence/translation_state.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+from .paths import state_dir
+
+
+def _default_state_dir() -> Path:
+    d = state_dir() / "translation_state"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def compute_document_hash(full_text: str) -> str:
+    data = (full_text or "").encode("utf-8", errors="ignore")
+    return hashlib.sha256(data).hexdigest()
+
+
+def _safe_filename(s: str, max_len: int = 80) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"[\\/:*?\"<>|]+", "_", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return "document"
+    if len(s) > max_len:
+        s = s[:max_len].rstrip()
+    return s
+
+
+def make_state_path(*, title: Optional[str], doc_hash: str) -> Path:
+    # Prefer human-friendly title if present; always include hash prefix for uniqueness.
+    base = _safe_filename(title or "")
+    if not base or base == "not provided":
+        base = doc_hash[:16]
+    name = f"{base}__{doc_hash[:16]}.json"
+    return _default_state_dir() / name
+
+
+def iter_state_files() -> list[Path]:
+    d = _default_state_dir()
+    return sorted(d.glob("*.json"))
+
+
+def load_state(path: Path) -> Dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_state(path: Path, obj: Dict[str, Any]) -> None:
+    # Atomic-ish write: write temp then replace
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def delete_state(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)  # py3.8+: missing_ok
+    except Exception:
+        # Best-effort cleanup
+        pass
+
+
+def find_state_by_hash(doc_hash: str) -> Optional[Tuple[Path, Dict[str, Any]]]:
+    for p in iter_state_files():
+        try:
+            obj = load_state(p)
+        except Exception:
+            continue
+        if obj.get("document_hash") == doc_hash:
+            return p, obj
+    return None
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/main.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+
+import sys
+from dotenv import load_dotenv
+from PyQt5.QtWidgets import QApplication
+
+from ai_book_translator.config.settings import Settings
+from ai_book_translator.ui.app_window import AppWindow
+
+
+def main() -> int:
+    load_dotenv()  # load .env into environment if present
+
+    app = QApplication(sys.argv)
+    settings = Settings()
+
+    w = AppWindow(settings=settings)
+    w.show()
+
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/services/__init__.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/services/chunking.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+
+from typing import List
+
+
+def chunk_by_chars(
+    text: str,
+    chunk_size: int,
+    *,
+    soft_split: bool = True,
+) -> List[str]:
+    """
+    Split text into chunks of at most `chunk_size` characters.
+
+    soft_split=True (default):
+      - Prefer splitting at natural boundaries (paragraphs, newlines, sentence ends, spaces)
+      - Fall back to hard splitting only if no good boundary is found
+
+    soft_split=False:
+      - Always split exactly by character count
+    """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be > 0")
+
+    if not text:
+        return []
+
+    if not soft_split:
+        return [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
+
+    chunks: List[str] = []
+    n = len(text)
+    i = 0
+
+    # Try split points in this priority order (first match from the end wins)
+    split_seps = ["\n\n", "\n", ". ", "? ", "! ", "; ", ": ", ", ", " "]
+
+    while i < n:
+        j = min(i + chunk_size, n)
+
+        # last chunk
+        if j >= n:
+            tail = text[i:n].strip()
+            if tail:
+                chunks.append(tail)
+            break
+
+        window = text[i:j]
+        split_at = None
+
+        for sep in split_seps:
+            k = window.rfind(sep)
+            if k != -1:
+                split_at = i + k + len(sep)
+                break
+
+        # Fallback: hard split if no boundary found
+        if split_at is None or split_at <= i:
+            split_at = j
+
+        chunk = text[i:split_at].strip()
+        if chunk:
+            chunks.append(chunk)
+
+        i = split_at
+
+    return chunks
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/services/connection_service.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+from ..infrastructure.llm.base import LLMProvider
+
+class ConnectionService:
+    def __init__(self, provider: LLMProvider):
+        self.provider = provider
+
+    def test(self) -> None:
+        self.provider.test_connection()
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/services/llm_json.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+from typing import Any, Dict
+
+from ..infrastructure.llm.base import LLMProvider
+from ..infrastructure.llm.json_parser import parse_json_strict, extract_json_object_loose
+from ..infrastructure.llm.exceptions import InvalidJSONError
+
+def chat_json_strict_with_repair(
+    provider: LLMProvider,
+    system_prompt: str,
+    user_prompt: str,
+    repair_retries: int = 2,
+    **kwargs: Any
+) -> Dict[str, Any]:
+    raw = provider.chat_text(system_prompt=system_prompt, user_prompt=user_prompt, **kwargs)
+
+    try:
+        return parse_json_strict(raw)
+    except InvalidJSONError:
+        extracted = extract_json_object_loose(raw)
+        if extracted:
+            try:
+                return parse_json_strict(extracted)
+            except InvalidJSONError:
+                pass
+
+    bad = raw
+    last_err: Exception | None = None
+    for _ in range(repair_retries):
+        fix_system = "Return STRICT JSON only. No extra text."
+        fix_user = (
+            "Rewrite the following into valid JSON matching the required schema. "
+            "Return only JSON.\n\n"
+            f"{bad}"
+        )
+        bad = provider.chat_text(system_prompt=fix_system, user_prompt=fix_user, **kwargs)
+        try:
+            return parse_json_strict(bad)
+        except InvalidJSONError as e:
+            last_err = e
+            continue
+
+    raise InvalidJSONError(f"Could not parse/repair JSON after retries: {last_err}")
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/services/metadata_service.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+from typing import Any, List
+
+from ..config.settings import Settings
+from ..domain.models import DocumentInput, MetadataResult
+from ..domain.schemas import validate_metadata_json, normalize_not_provided
+from ..infrastructure.llm.base import LLMProvider
+from ..infrastructure.llm.exceptions import (
+    UploadNotSupportedError,
+    UploadFailedError,
+    TransientLLMError,
+    DocumentReadError,
+)
+from ..infrastructure.llm.json_parser import parse_json_strict
+from ..infrastructure.llm.exceptions import InvalidJSONError
+from .chunking import chunk_by_chars
+from .prompts import (
+    METADATA_SYSTEM_PROMPT,
+    METADATA_USER_PROMPT_UPLOAD,
+    METADATA_REPAIR_PROMPT,
+    LOCAL_CHUNK_SUMMARY_SYSTEM_PROMPT,
+    build_local_chunk_summary_user_prompt,
+    SUMMARY_OF_SUMMARIES_SYSTEM_PROMPT,
+    build_summary_of_summaries_user_prompt,
+)
+from .llm_json import chat_json_strict_with_repair
+
+
+class MetadataService:
+    def __init__(self, provider: LLMProvider, settings: Settings):
+        self.provider = provider
+        self.settings = settings
+
+    def generate_metadata(
+        self, doc: DocumentInput, target_language: str, **kwargs: Any
+    ) -> MetadataResult:
+        # Attempt upload-first if file_path is provided
+        if doc.file_path:
+            try:
+                meta = self._upload_metadata(doc.file_path, **kwargs)
+                meta = normalize_not_provided(meta)
+                validate_metadata_json(meta)
+                meta["target_language"] = target_language
+                return MetadataResult(metadata=meta, strategy_used="upload")
+
+            except (UploadNotSupportedError, UploadFailedError) as e:
+                return self._chunked_fallback(
+                    doc, target_language, reason=str(e), **kwargs
+                )
+
+            except TransientLLMError:
+                for _ in range(self.settings.upload_retries):
+                    try:
+                        meta = self._upload_metadata(doc.file_path, **kwargs)
+                        meta = normalize_not_provided(meta)
+                        validate_metadata_json(meta)
+                        meta["target_language"] = target_language
+                        return MetadataResult(metadata=meta, strategy_used="upload")
+                    except TransientLLMError:
+                        continue
+                    except (UploadNotSupportedError, UploadFailedError) as e:
+                        return self._chunked_fallback(
+                            doc, target_language, reason=str(e), **kwargs
+                        )
+                return self._chunked_fallback(
+                    doc, target_language, reason="upload transient failure", **kwargs
+                )
+
+        # No file_path => direct fallback (pasted text flow)
+        return self._chunked_fallback(
+            doc, target_language, reason="no file provided for upload", **kwargs
+        )
+
+    def _upload_metadata(self, file_path: str, **kwargs: Any) -> dict:
+        system = METADATA_SYSTEM_PROMPT
+        user = METADATA_USER_PROMPT_UPLOAD
+
+        METADATA_SCHEMA = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["author(s)", "title", "language", "summary", "chapters"],
+            "properties": {
+                "author(s)": {"type": "string"},
+                "title": {"type": "string"},
+                "language": {"type": "string"},
+                "summary": {"type": "string"},
+                "chapters": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                            "general": {"type": "string"},
+                            "detailed": {"type": "string"},
+                        },
+                        "required": ["general", "detailed"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        }
+
+        # 1) Golden standard attempt: schema-enforced output (OpenAI)
+        raw = None
+        try:
+            raw = self.provider.chat_text_with_document(
+                system_prompt=system,
+                user_prompt=user,
+                file_path=file_path,
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "strict": True,
+                        "name": "book_metadata",
+                        "schema": METADATA_SCHEMA,
+                    }
+                },
+                max_output_tokens=2000,
+                **kwargs,
+            )
+        except (UploadNotSupportedError, UploadFailedError, TransientLLMError):
+            # Critical errors should bubble up to generate_metadata handler
+            raise
+        except Exception:
+            # Other errors (e.g. model doesn't support structured outputs): fall back to prompt-only
+            raw = None
+
+        # If schema-mode produced something, try parsing it directly
+        if raw:
+            try:
+                return parse_json_strict(raw)
+            except InvalidJSONError:
+                pass  # fall through to prompt-only repair
+
+        # 2) Fallback: prompt-enforced JSON (no schema formatting)
+        # (Still strict, plus repair loop)
+        raw2 = self.provider.chat_text_with_document(
+            system_prompt=system,
+            user_prompt=user,
+            file_path=file_path,
+            max_output_tokens=2000,
+            **kwargs,
+        )
+
+        # Parse; if invalid, repair via normal chat (no re-upload)
+        try:
+            return parse_json_strict(raw2)
+        except InvalidJSONError:
+            return chat_json_strict_with_repair(
+                provider=self.provider,
+                system_prompt=system,
+                user_prompt=METADATA_REPAIR_PROMPT + raw2,
+                repair_retries=self.settings.json_repair_retries,
+                **kwargs,
+            )
+
+    def _chunked_fallback(
+        self, doc: DocumentInput, target_language: str, reason: str, **kwargs: Any
+    ) -> MetadataResult:
+        if doc.raw_text is None:
+            raise DocumentReadError(
+                "Chunked fallback requires raw_text (extract the document first)."
+            )
+
+        chunks = chunk_by_chars(doc.raw_text, self.settings.local_metadata_chunk_chars)
+
+        chunk_summaries: List[str] = []
+        for i, ch in enumerate(
+            chunks[: self.settings.max_chunk_summaries_for_summary_of_summaries]
+        ):
+            is_early = (
+                i < self.settings.local_metadata_first_chunks_with_title_author_hint
+            )
+            sys = LOCAL_CHUNK_SUMMARY_SYSTEM_PROMPT
+            usr = build_local_chunk_summary_user_prompt(ch, is_early_chunk=is_early)
+            s = self.provider.chat_text(
+                system_prompt=sys, user_prompt=usr, **kwargs
+            ).strip()
+            chunk_summaries.append(s)
+
+        system = SUMMARY_OF_SUMMARIES_SYSTEM_PROMPT
+        user = build_summary_of_summaries_user_prompt(chunk_summaries)
+
+        meta = chat_json_strict_with_repair(
+            provider=self.provider,
+            system_prompt=system,
+            user_prompt=user,
+            repair_retries=self.settings.json_repair_retries,
+            **kwargs,
+        )
+
+        meta = normalize_not_provided(meta)
+        validate_metadata_json(meta)
+        meta["target_language"] = target_language
+        return MetadataResult(
+            metadata=meta, strategy_used="chunked", fallback_reason=reason
+        )
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/services/prompts.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+from typing import List, Any, Dict, Optional
+
+# =========================
+# STEP 1 — METADATA (UPLOAD / GLOBAL)
+# =========================
+
+METADATA_SYSTEM_PROMPT = (
+    "Extract book metadata and return ONLY a single JSON object (no markdown, no extra text). "
+    "The JSON must contain EXACTLY these keys and no others: "
+    '"author(s)", "title", "language", "summary", "chapters". '
+    'If a field is not present, use the EXACT string "not provided", '
+    "EXCEPT for fields explicitly marked below as inferable or generatable. "
+    '"author(s)" MUST be a single string of names separated by comma+space (", "), never an array. '
+    '"chapters" MUST be a JSON object where each key is a chapter identifier string and each value is an object '
+    'with two keys: "general" (a short 1-3 sentence summary) and "detailed" (a detailed short essay summary); '
+    "if chapters cannot be inferred, output an empty object {}.\n\n"
+    "IMPORTANT — INFERENCE & GENERATION RULES:\n"
+    '- "language": MUST be inferred automatically from the document text if not explicitly stated. '
+    'Use "not provided" ONLY if the language cannot be reliably identified.\n'
+    '- "summary": MUST be generated by you if it is not explicitly present in the document. '
+    'Use "not provided" ONLY if a summary cannot be generated due to insufficient or corrupted text.\n'
+)
+
+METADATA_USER_PROMPT_UPLOAD = "Return the metadata JSON for the uploaded document."
+
+# Used only when schema-mode fails or returns unusable output:
+METADATA_REPAIR_PROMPT = (
+    "You MUST rewrite the content below into VALID JSON ONLY.\n"
+    "This is a DATA REPAIR task, not a summarization or explanation task.\n\n"
+    "OUTPUT REQUIREMENTS (MANDATORY):\n"
+    "1. Output MUST be a single valid JSON object.\n"
+    "2. Do NOT include any text before or after the JSON.\n"
+    "3. Do NOT include markdown, comments, explanations, or formatting.\n\n"
+    "JSON SCHEMA (YOU MUST FOLLOW EXACTLY):\n"
+    "- The JSON object MUST contain EXACTLY the following 5 keys:\n"
+    '  • "author(s)"\n'
+    '  • "title"\n'
+    '  • "language"\n'
+    '  • "summary"\n'
+    '  • "chapters"\n\n'
+    "KEY CONSTRAINTS:\n"
+    '- "author(s)":\n'
+    "  • MUST be a SINGLE STRING\n"
+    '  • MUST list author names separated by comma + space (", ")\n'
+    "  • MUST NOT be a JSON array\n"
+    '  • If authors are unknown, use the EXACT string "not provided"\n\n'
+    '- "title":\n'
+    "  • MUST be a STRING\n"
+    '  • If title is unknown, use the EXACT string "not provided"\n\n'
+    '- "language":\n'
+    "  • MUST be a STRING\n"
+    "  • MUST be inferred automatically from the document text if not explicitly stated. "
+    '  • Use "not provided" ONLY if the language cannot be reliably identified.\n\n'
+    '- "summary":\n'
+    "  • MUST be a STRING\n"
+    "  • Must be a paragraph summarizing the document\n"
+    "  • If summary cannot be inferred, generate it on your own."
+    'And only when it can\'t be generated because of reasons like document encding errors use the EXACT string "not provided"\n\n'
+    '- "chapters":\n'
+    "  • MUST be a JSON OBJECT (dictionary)\n"
+    "  • Each KEY must be a chapter identifier (string)\n"
+    '  • Each VALUE must be an OBJECT with exactly two keys: "general" (1-3 sentences) and "detailed" (short essay)\n'
+    "  • MUST NOT be an array\n"
+    "  • If chapters cannot be inferred, use an EMPTY OBJECT {}\n\n"
+    "ADDITIONAL STRICT RULES:\n"
+    "- NO additional keys are allowed (additionalProperties = false).\n"
+    '- All values MUST be strings, except "chapters" which is an object of string → object.\n'
+    "- Do NOT invent information for fields: title, authors, chapters.\n"
+    "- Do NOT omit required keys.\n"
+    "EXAMPLE OF A CORRECT RESPONSE (FORMAT ONLY):\n"
+    "{\n"
+    '  "author(s)": "Carl Gustav Jung",\n'
+    '  "title": "Über die Psychologie des Unbewussten",\n'
+    '  "language": "German",\n'
+    '  "summary": "This work explores the structure and dynamics of the unconscious mind, introducing foundational concepts of analytical psychology such as archetypes, the collective unconscious, and symbolic interpretation of mythological and psychological material.",\n'
+    '  "chapters": {\n'
+    '    "Chapter 1": {\n'
+    '      "general": "Introduction to the concept of the unconscious and its role in psychological life.",\n'
+    '      "detailed": "Jung introduces the concept of the unconscious not as a mere repository of repressed memories, but as a dynamic and creative force..."\n'
+    "    },\n"
+    '    "Chapter 2": {\n'
+    '      "general": "Analysis of mythological symbols and their psychological significance.",\n'
+    '      "detailed": "In this chapter, the author examines various myths from different cultures to demonstrate the universality of certain symbols..."\n'
+    "    }\n"
+    "  }\n"
+    "}\n\n"
+    "INPUT TO REPAIR:\n"
+)
+
+# =========================
+# STEP 1 — LOCAL LLM CHUNK SUMMARIZATION
+# =========================
+
+LOCAL_CHUNK_SUMMARY_SYSTEM_PROMPT = (
+    "Summarize the provided chunk of a book. Be VERY brief. "
+    "Output plain text only (no JSON)."
+)
+
+
+def build_local_chunk_summary_user_prompt(
+    chunk_text: str,
+    *,
+    is_early_chunk: bool,
+) -> str:
+    extra = ""
+    if is_early_chunk:
+        extra = (
+            "\n\nIf you can infer the book title and author(s), mention them. "
+            "If you can infer a chapter list, mention it explicitly."
+        )
+    return f"Chunk text:\n{chunk_text}{extra}"
+
+
+# =========================
+# STEP 1 — SUMMARY OF SUMMARIES (LOCAL LLM)
+# =========================
+
+SUMMARY_OF_SUMMARIES_SYSTEM_PROMPT = (
+    METADATA_SYSTEM_PROMPT
+    + " The input is a list of chunk summaries, not the original document."
+)
+
+
+def build_summary_of_summaries_user_prompt(
+    chunk_summaries: List[str],
+) -> str:
+    joined = "\n\n".join(f"- {s.strip()}" for s in chunk_summaries if s.strip())
+    return (
+        "Synthesize the following chunk summaries into the required metadata JSON.\n\n"
+        f"Chunk summaries:\n{joined}"
+    )
+
+
+# =========================
+# STEP 2 — TRANSLATION
+# =========================
+
+
+def build_translation_system_prompt(previous_tail: str) -> str:
+
+    # TODO remove
+    print("SYSTEM PROMPT 4 TRANSLATION -->", (
+        "You are a professional book translator.\n"
+        'Return STRICT JSON only: {"chapter": "...", "translation": "..."}.\n'
+        'The "chapter" field MUST match the exact chapter key from the "Chapters Context".\n'
+        "If you clearly detect the start of a NEW chapter in the chunk text, update the chapter.\n"
+        "Otherwise, keep the current chapter provided in the user prompt.\n"
+        "If unsure whether a new chapter starts, do NOT change the chapter.\n"
+        "No markdown. No commentary.\n"
+        "\n"
+        "TRANSLATION OUTPUT RULES:\n"
+        "- The translated text must preserve the original meaning and paragraph structure.\n"
+        "- Lines that contain ONLY a page number (e.g., '12') surrounded by blank lines MUST be omitted.\n"
+        "- Meaningful numbered items (e.g., '1. Introduction', references, equations, figure/table numbers) MUST be kept.\n"
+        "\n"
+        "FORMATTING REPAIR RULES (apply only if clearly needed):\n"
+        "- If a TAB character (\\t) appears in the middle of a line and likely represents a broken line break,\n"
+        "  replace it with a newline followed by a tab ('\\n\\t') in the translation.\n"
+        "- Do NOT modify tabs that are clearly used for tables, code blocks, or aligned columns.\n"
+        "- Do NOT intentionally add or remove paragraphs.\n"
+        "\n\n"
+        f"Tail of the previous chunk of source text (last 300 chars):\n{previous_tail}"
+    ))
+
+    return (
+        "You are a professional book translator.\n"
+        'Return STRICT JSON only: {"chapter": "...", "translation": "..."}.\n'
+        'The "chapter" field MUST match the exact chapter key from the "Chapters Context".\n'
+        "If you clearly detect the start of a NEW chapter in the chunk text, update the chapter.\n"
+        "Otherwise, keep the current chapter provided in the user prompt.\n"
+        "If unsure whether a new chapter starts, do NOT change the chapter.\n"
+        "No markdown. No commentary.\n"
+        "\n"
+        "TRANSLATION OUTPUT RULES:\n"
+        "- The translated text must preserve the original meaning and paragraph structure.\n"
+        "- Lines that contain ONLY a page number (e.g., '12') surrounded by blank lines MUST be omitted.\n"
+        "- Meaningful numbered items (e.g., '1. Introduction', references, equations, figure/table numbers) MUST be kept.\n"
+        "\n"
+        "FORMATTING REPAIR RULES (apply only if clearly needed):\n"
+        "- If a TAB character (\\t) appears in the middle of a line and likely represents a broken line break,\n"
+        "  replace it with a newline followed by a tab ('\\n\\t') in the translation.\n"
+        "- Do NOT modify tabs that are clearly used for tables, code blocks, or aligned columns.\n"
+        "- Do NOT intentionally add or remove paragraphs.\n"
+        "\n\n"
+        f"Tail of the previous chunk of source text (last 300 chars):\n{previous_tail}"
+    )
+
+
+def build_translation_user_prompt(
+    chunk_text: str,
+    target_language: str,
+    current_chapter: Optional[str],
+    context: Optional[Dict[str, Any]] = None,
+) -> str:
+    # 1) Build context block with dynamic chapter summaries
+    context_parts = []
+
+    if context:
+        # Title & Author
+        title = context.get("title")
+        author = context.get("author(s)")
+        if title and title != "not provided":
+            context_parts.append(f"Title: {title}")
+        if author and author != "not provided":
+            context_parts.append(f"Author(s): {author}")
+
+        # Global Summary
+        summary = context.get("summary")
+        if summary and summary != "not provided":
+            context_parts.append(f"Book Summary: {summary}")
+
+        # Dynamic Chapter List
+        chapters = context.get("chapters")
+        print("CHAPTERS --->", chapters)
+        if isinstance(chapters, dict) and chapters:
+            chapter_lines = []
+            for ch_id, ch_data in chapters.items():
+                print("CHAPTER ID:", ch_id, "\nCHAPTER DATA:", ch_data)
+                if not isinstance(ch_data, dict):
+                    continue
+
+                # Check if this is the current chapter
+                # Normalization: simple strip/lower check or direct match
+                is_current = False
+                if (
+                    current_chapter
+                    and str(ch_id).strip() == str(current_chapter).strip()
+                ):
+                    is_current = True
+
+                desc = ch_data.get("detailed" if is_current else "general")
+                if desc:
+                    chapter_lines.append(f"- {ch_id} - {desc}")
+
+            if chapter_lines:
+                context_parts.append("Chapters Context:")
+                context_parts.extend(chapter_lines)
+
+    ctx_block = ""
+    if context_parts:
+        ctx_block = "Context:\n" + "\n".join(context_parts) + "\n\n"
+
+    return (
+        f"{ctx_block}"
+        f"Target language: {target_language}\n"
+        f"Current chapter (from previous chunk; keep unless a new chapter clearly starts): {current_chapter}\n\n"
+        "TASK:\n"
+        "1) Translate ONLY the text inside <TEXT_TO_TRANSLATE> ... </TEXT_TO_TRANSLATE>.\n"
+        "2) Do NOT translate any other parts of this prompt (Context, Target language line, etc.).\n"
+        "3) Return STRICT JSON only.\n\n"
+        "<TEXT_TO_TRANSLATE>\n"
+        f"{chunk_text}\n"
+        "</TEXT_TO_TRANSLATE>\n\n"
+        "Output JSON only."
+    )
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/services/translation_service.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/ui/__init__.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/ui/app_window.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional, Any, Dict
+import hashlib
+
+from PyQt5.QtWidgets import QMainWindow, QStackedWidget
+
+from ai_book_translator.config.settings import Settings
+from ai_book_translator.domain.models import DocumentInput, MetadataResult
+from ai_book_translator.infrastructure.llm.base import LLMProvider
+
+from .pages.model_setup_page import ModelSetupPage
+from .pages.book_input_page import BookInputPage
+from .pages.metadata_page import MetadataPage
+from .pages.translate_page import TranslatePage
+
+from ai_book_translator.infrastructure.persistence.metadata_cache import (
+    find_metadata_cache_by_hash,
+    load_metadata_cache,
+)
+
+try:
+    from ai_book_translator.infrastructure.io.read_document.base import ReadDocument
+except Exception:
+    ReadDocument = None
+
+
+def _doc_hash_from_text(text: str) -> str:
+    b = (text or "").encode("utf-8", errors="ignore")
+    return hashlib.sha256(b).hexdigest()
+
+
+# ---- Translation resume (adapt imports to your actual module) ----
+try:
+    from ai_book_translator.infrastructure.persistence.translation_state import (
+        find_state_by_hash,
+        load_state,
+    )
+except Exception:
+    find_state_by_hash = None
+    load_state = None
+
+
+@dataclass
+class AppState:
+    provider: Optional[LLMProvider] = None
+    target_language: str = "Ukrainian"
+    document: Optional[DocumentInput] = None
+    metadata_result: Optional[MetadataResult] = None
+    translation_state: Optional[Dict[str, Any]] = None
+    translation_state_path: Optional[str] = None
+
+
+class AppWindow(QMainWindow):
+    def __init__(self, settings: Settings):
+        super().__init__()
+        self.settings = settings
+        self.state = AppState()
+
+        self.setWindowTitle("AI-book-translator")
+        self.resize(980, 720)
+
+        self._stack = QStackedWidget()
+        self.setCentralWidget(self._stack)
+
+        self.page_model = ModelSetupPage(on_success=self._on_model_ready)
+        self.page_input = BookInputPage(
+            on_next=self._on_document_ready, on_back=self._go_model_setup
+        )
+        self.page_metadata = MetadataPage(
+            on_done=self._on_metadata_ready, on_back=self._go_book_input
+        )
+        self.page_translate = TranslatePage(on_back=self._go_book_input)
+
+        self._stack.addWidget(self.page_model)  # idx 0
+        self._stack.addWidget(self.page_input)  # idx 1
+        self._stack.addWidget(self.page_metadata)  # idx 2
+        self._stack.addWidget(self.page_translate)  # idx 3
+
+        self._stack.setCurrentIndex(0)
+
+    def _go_model_setup(self) -> None:
+        self._stack.setCurrentIndex(0)
+
+    def _go_book_input(self) -> None:
+        self._stack.setCurrentIndex(1)
+
+    def _go_metadata(self) -> None:
+        self._stack.setCurrentIndex(2)
+        self.page_metadata.start(
+            provider=self.state.provider,
+            settings=self.settings,
+            document=self.state.document,
+            target_language=self.state.target_language,
+        )
+
+    def _go_translate(self) -> None:
+        self._stack.setCurrentIndex(3)
+        self.page_translate.start(
+            provider=self.state.provider,
+            settings=self.settings,
+            document=self.state.document,
+            metadata_result=self.state.metadata_result,
+            target_language=self.state.target_language,
+            resume_state=self.state.translation_state,
+            resume_state_path=self.state.translation_state_path,
+        )
+
+    def _on_model_ready(
+        self, provider: LLMProvider, target_language: str, settings: Settings
+    ) -> None:
+        self.state.provider = provider
+        self.state.target_language = target_language
+        self.settings = settings
+        self._go_book_input()
+
+    def _on_document_ready(self, doc: DocumentInput) -> None:
+        """
+        New behavior:
+        - Ensure raw_text exists if possible (needed for hashing + local fallbacks)
+        - Compute document_hash from FULL TEXT
+        - Resume priority:
+            1) translation state
+            2) metadata cache
+            3) fresh metadata generation
+        """
+        # Ensure raw_text (for hashing)
+        if doc.raw_text is None and doc.file_path and ReadDocument is not None:
+            try:
+                raw = ReadDocument.from_path(doc.file_path).read(doc.file_path)
+                doc = DocumentInput(file_path=doc.file_path, raw_text=raw)
+            except Exception:
+                # keep as-is; may still work via upload-first metadata
+                pass
+
+        self.state.document = doc
+
+        # Reset state related to previous document
+        self.state.translation_state = None
+        self.state.translation_state_path = None
+        self.state.metadata_result = None
+
+        doc_hash: Optional[str] = None
+        if doc.raw_text:
+            doc_hash = _doc_hash_from_text(doc.raw_text)
+
+        # 1) Try resume translation first (if your state_store supports it)
+        if doc_hash and find_state_by_hash:
+            try:
+                found = find_state_by_hash(doc_hash)
+                if found:
+                    p, st = found
+                    self.state.translation_state = st
+                    self.state.translation_state_path = str(p)
+
+                    # If your TranslationWorker reads state directly, you may not need metadata_result here.
+                    # But we try to populate metadata_result if available in state.
+                    meta = st.get("metadata")
+                    
+                    # Handle metadata_path if full metadata object is missing (new schema) ---
+                    if not meta and "metadata_path" in st:
+                        try:
+                            mpath = st["metadata_path"]
+                            if mpath:
+                                rec = load_metadata_cache(mpath)
+                                if rec and rec.metadata:
+                                    meta = rec.metadata
+                        except Exception:
+                            pass
+                    # -------------------------------------------------------------------------------
+
+                    if isinstance(meta, dict) and meta:
+                        self.state.metadata_result = MetadataResult(
+                            metadata=meta,
+                            strategy_used="resume",
+                            fallback_reason=None,
+                        )
+                    self._go_translate()
+                    return
+            except Exception:
+                # If resume load fails, continue to metadata cache/fresh metadata
+                pass
+
+        # 2) Try reuse cached metadata (metadata-only resume)
+        if doc_hash:
+            p2 = find_metadata_cache_by_hash(doc_hash)
+            if p2:
+                try:
+                    rec = load_metadata_cache(p2)
+                    self.state.metadata_result = MetadataResult(
+                        metadata=dict(rec.metadata or {}),
+                        strategy_used="cached_metadata",
+                        fallback_reason=None,
+                    )
+                    self._go_translate()
+                    return
+                except Exception:
+                    pass
+
+        # 3) No resume possible -> run metadata extraction
+        self._go_metadata()
+
+    def _on_metadata_ready(self, metadata_result: MetadataResult) -> None:
+        self.state.metadata_result = metadata_result
+        self._go_translate()
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/ui/pages/__init__.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/ui/pages/book_input_page.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+
+from typing import Callable
+from pathlib import Path
+
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QLabel, QPushButton, QHBoxLayout, QFileDialog,
+    QTextEdit, QRadioButton, QButtonGroup, QGroupBox
+)
+
+from ai_book_translator.domain.models import DocumentInput
+from ..widgets.error_banner import ErrorBanner
+
+
+class BookInputPage(QWidget):
+    def __init__(self, on_next: Callable[[DocumentInput], None], on_back: Callable[[], None]):
+        super().__init__()
+        self._on_next = on_next
+        self._on_back = on_back
+
+        self.banner = ErrorBanner()
+
+        root = QVBoxLayout()
+        root.setContentsMargins(22, 22, 22, 22)
+        root.setSpacing(14)
+
+        title = QLabel("Step 1 — Book input")
+        title.setStyleSheet("font-size: 22px; font-weight: 700;")
+
+        self.radio_file = QRadioButton("Upload PDF/TXT")
+        self.radio_paste = QRadioButton("Paste text")
+        self.radio_file.setChecked(True)
+        bg = QButtonGroup(self)
+        bg.addButton(self.radio_file)
+        bg.addButton(self.radio_paste)
+        self.radio_file.toggled.connect(self._sync)
+
+        file_box = QGroupBox("File")
+        self.btn_choose = QPushButton("Choose PDF/TXT…")
+        self.btn_choose.clicked.connect(self._choose_file)
+        self.lbl_file = QLabel("No file selected")
+        self.lbl_file.setStyleSheet("color: #666;")
+        fb = QVBoxLayout()
+        fb.addWidget(self.btn_choose)
+        fb.addWidget(self.lbl_file)
+        file_box.setLayout(fb)
+
+        paste_box = QGroupBox("Paste text")
+        self.txt = QTextEdit()
+        self.txt.setPlaceholderText("Paste book text here…")
+        pb = QVBoxLayout()
+        pb.addWidget(self.txt)
+        paste_box.setLayout(pb)
+
+        self._selected_path: str | None = None
+
+        nav = QHBoxLayout()
+        btn_back = QPushButton("Back")
+        btn_back.clicked.connect(self._on_back)
+        btn_next = QPushButton("Next")
+        btn_next.clicked.connect(self._next)
+
+        nav.addWidget(btn_back)
+        nav.addStretch(1)
+        nav.addWidget(btn_next)
+
+        root.addWidget(title)
+        root.addWidget(self.banner)
+        root.addWidget(self.radio_file)
+        root.addWidget(file_box)
+        root.addWidget(self.radio_paste)
+        root.addWidget(paste_box)
+        root.addStretch(1)
+        root.addLayout(nav)
+
+        self.setLayout(root)
+        self._sync()
+
+    def _sync(self) -> None:
+        use_file = self.radio_file.isChecked()
+        self.btn_choose.setEnabled(use_file)
+        self.txt.setEnabled(not use_file)
+
+    def _choose_file(self) -> None:
+        self.banner.hide()
+        fn, _ = QFileDialog.getOpenFileName(self, "Select book file", "", "Documents (*.pdf *.txt)")
+        if not fn:
+            return
+        self._selected_path = fn
+        self.lbl_file.setText(Path(fn).name)
+
+    def _next(self) -> None:
+        self.banner.hide()
+        if self.radio_file.isChecked():
+            if not self._selected_path:
+                self.banner.show_error("Please choose a PDF or TXT file.")
+                return
+            self._on_next(DocumentInput(file_path=self._selected_path, raw_text=None))
+        else:
+            text = self.txt.toPlainText().strip()
+            if not text:
+                self.banner.show_error("Please paste some text.")
+                return
+            self._on_next(DocumentInput(file_path=None, raw_text=text))
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/ui/pages/metadata_page.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+
+from typing import Callable, Optional
+
+from PyQt5.QtWidgets import (
+    QWidget,
+    QVBoxLayout,
+    QLabel,
+    QPushButton,
+    QHBoxLayout,
+    QTextEdit,
+)
+
+from ai_book_translator.config.settings import Settings
+from ai_book_translator.domain.models import DocumentInput, MetadataResult
+from ai_book_translator.infrastructure.llm.base import LLMProvider
+
+from ..widgets.error_banner import ErrorBanner
+from ..widgets.progress_widget import ProgressWidget
+from ..workers.metadata_worker import MetadataWorker
+
+
+class MetadataPage(QWidget):
+    def __init__(
+        self, on_done: Callable[[MetadataResult], None], on_back: Callable[[], None]
+    ):
+        super().__init__()
+        self._on_done = on_done
+        self._on_back = on_back
+        self._worker: Optional[MetadataWorker] = None
+        self._last_result: Optional[MetadataResult] = None
+
+        root = QVBoxLayout()
+        root.setContentsMargins(22, 22, 22, 22)
+        root.setSpacing(14)
+
+        title = QLabel("Step 1 — Metadata extraction")
+        title.setStyleSheet("font-size: 22px; font-weight: 700;")
+
+        self.banner = ErrorBanner()
+        self.progress = ProgressWidget("Generating metadata JSON…")
+
+        self.preview = QTextEdit()
+        self.preview.setReadOnly(True)
+        self.preview.setPlaceholderText("Metadata JSON will appear here when ready…")
+
+        nav = QHBoxLayout()
+        btn_back = QPushButton("Back")
+        btn_back.clicked.connect(self._on_back)
+        self.btn_continue = QPushButton("Continue")
+        self.btn_continue.setEnabled(False)
+        self.btn_continue.clicked.connect(self._continue)
+
+        nav.addWidget(btn_back)
+        nav.addStretch(1)
+        nav.addWidget(self.btn_continue)
+
+        root.addWidget(title)
+        root.addWidget(self.banner)
+        root.addWidget(self.progress)
+        root.addWidget(self.preview, 1)
+        root.addLayout(nav)
+
+        self.setLayout(root)
+
+    def start(
+        self,
+        provider: LLMProvider,
+        settings: Settings,
+        document: DocumentInput,
+        target_language: str,
+    ) -> None:
+        self.banner.hide()
+        self.progress.set_progress(0)
+        self.progress.set_stage("")
+        self.preview.clear()
+        self.btn_continue.setEnabled(False)
+        self._last_result = None
+
+        if provider is None:
+            self.banner.show_error("Provider is not configured.")
+            return
+        if document is None:
+            self.banner.show_error("No document provided.")
+            return
+
+        display_name = ""
+        if document.file_path:
+            display_name = str(document.file_path)
+        else:
+            display_name = "pasted text"
+
+        self._worker = MetadataWorker(
+            provider=provider,
+            settings=settings,
+            document=document,
+            target_language=target_language,
+            display_name=display_name,
+        )
+        self._worker.progressed.connect(self._on_progress)
+        self._worker.succeeded.connect(self._on_success)
+        self._worker.failed.connect(self._on_fail)
+        self._worker.start()
+
+    def _on_progress(self, pct: int, stage: str) -> None:
+        self.progress.set_progress(pct)
+        self.progress.set_stage(stage)
+
+    def _on_success(self, res: MetadataResult) -> None:
+        import json
+
+        self._last_result = res
+        self.preview.setPlainText(
+            json.dumps(res.metadata, ensure_ascii=False, indent=2)
+        )
+        self.btn_continue.setEnabled(True)
+
+    def _on_fail(self, msg: str) -> None:
+        self.banner.show_error(msg)
+
+    def _continue(self) -> None:
+        if self._last_result is not None:
+            self._on_done(self._last_result)
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/ui/pages/model_setup_page.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+
+import os
+from typing import Callable, Optional
+
+from PyQt5.QtWidgets import (
+    QWidget,
+    QVBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QHBoxLayout,
+    QComboBox,
+)
+
+from ai_book_translator.config.settings import Settings
+from ai_book_translator.infrastructure.llm.openai_provider import (
+    OpenAIResponsesProvider,
+)
+from ai_book_translator.infrastructure.llm.local_provider import LocalOllamaProvider
+from ai_book_translator.services.connection_service import ConnectionService
+
+from ..widgets.error_banner import ErrorBanner
+
+
+class ModelSetupPage(QWidget):
+    """
+    Step 0 — Model setup
+    """
+
+    def __init__(self, on_success: Callable[..., None]):
+        super().__init__()
+        self._on_success = on_success
+
+        root = QVBoxLayout()
+        root.setContentsMargins(22, 22, 22, 22)
+        root.setSpacing(14)
+
+        title = QLabel("Step 0 — Model setup")
+        title.setStyleSheet("font-size: 22px; font-weight: 700;")
+
+        self.banner = ErrorBanner()
+
+        # Provider selector
+        provider_row = QHBoxLayout()
+        provider_row.addWidget(QLabel("Provider:"))
+        self.provider_combo = QComboBox()
+        self.provider_combo.addItems(["openai", "ollama"])
+        self.provider_combo.currentTextChanged.connect(self._sync_visibility)
+        provider_row.addWidget(self.provider_combo)
+        provider_row.addStretch(1)
+
+        # OpenAI
+        self.openai_key = QLineEdit()
+        self.openai_key.setPlaceholderText("sk-proj-kn... (OPENAI_API_KEY)")
+        self.openai_model = QLineEdit()
+        self.openai_model.setPlaceholderText("gpt-5-nano")
+
+        # Ollama
+        self.ollama_base_url = QLineEdit()
+        self.ollama_base_url.setPlaceholderText("http://localhost:11434")
+        self.ollama_model = QLineEdit()
+        self.ollama_model.setPlaceholderText("llama3.1")
+
+        # Target language
+        self.target_language = QLineEdit()
+        self.target_language.setPlaceholderText("e.g., Ukrainian")
+
+        # translation chunk size
+        chunk_row = QHBoxLayout()
+        chunk_row.addWidget(QLabel("Chunk size (chars):"))
+        self.chunk_chars = QLineEdit()
+        self.chunk_chars.setPlaceholderText("30 000")
+        self.chunk_chars.setFixedWidth(120)
+        chunk_row.addWidget(self.chunk_chars)
+        chunk_row.addStretch(1)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        self.btn_continue = QPushButton("Continue")
+        self.btn_continue.clicked.connect(self._handle_continue)
+        btn_row.addWidget(self.btn_continue)
+
+        # Layout
+        root.addWidget(title)
+        root.addWidget(self.banner)
+        root.addLayout(provider_row)
+
+        root.addWidget(QLabel("OpenAI API key:"))
+        root.addWidget(self.openai_key)
+        root.addWidget(QLabel("OpenAI model:"))
+        root.addWidget(self.openai_model)
+
+        root.addWidget(QLabel("Ollama base URL:"))
+        root.addWidget(self.ollama_base_url)
+        root.addWidget(QLabel("Ollama model:"))
+        root.addWidget(self.ollama_model)
+
+        root.addWidget(QLabel("Target language:"))
+        root.addWidget(self.target_language)
+
+        root.addLayout(chunk_row)
+        root.addLayout(btn_row)
+
+        self.setLayout(root)
+        self._sync_visibility(self.provider_combo.currentText())
+
+    def _sync_visibility(self, provider_name: str) -> None:
+        is_openai = provider_name == "openai"
+
+        self.openai_key.setEnabled(is_openai)
+        self.openai_model.setEnabled(is_openai)
+
+        self.ollama_base_url.setEnabled(not is_openai)
+        self.ollama_model.setEnabled(not is_openai)
+
+    def _parse_chunk_chars(self, s: str) -> Optional[int]:
+        raw = (s or "").strip()
+        if not raw:
+            return None
+        n = int(raw)
+        if n < 200 or n > 200_000:
+            raise ValueError("chunk size out of range")
+        return n
+
+    def _settings_with_optional_override(self) -> Settings:
+        base = Settings()
+        override = self._parse_chunk_chars(self.chunk_chars.text())
+        if override is None:
+            return base
+
+        # Settings is frozen=True => construct a new instance with the override
+        return Settings(
+            upload_retries=base.upload_retries,
+            json_repair_retries=base.json_repair_retries,
+            translation_chunk_chars=override,
+            local_metadata_chunk_chars=base.local_metadata_chunk_chars,
+            local_metadata_first_chunks_with_title_author_hint=base.local_metadata_first_chunks_with_title_author_hint,
+            max_chunk_summaries_for_summary_of_summaries=base.max_chunk_summaries_for_summary_of_summaries,
+        )
+
+    def _handle_continue(self) -> None:
+        self.banner.hide()
+
+        provider_name = self.provider_combo.currentText().strip()
+        target_lang = (self.target_language.text() or "").strip()
+        if not target_lang:
+            self.banner.show_error("Please enter target language.")
+            return
+
+        # Build settings (with optional override)
+        try:
+            settings = self._settings_with_optional_override()
+        except Exception:
+            self.banner.show_error(
+                "Chunk size must be an integer between 200 and 200000."
+            )
+            return
+
+        # Create provider
+        try:
+            if provider_name == "openai":
+                api_key = (self.openai_key.text() or "").strip() or os.getenv(
+                    "OPENAI_API_KEY", ""
+                )
+                model = (self.openai_model.text() or "").strip() or "gpt-5-nano"
+                if not api_key:
+                    self.banner.show_error(
+                        "OpenAI API key is missing. Enter it or set OPENAI_API_KEY."
+                    )
+                    return
+                provider = OpenAIResponsesProvider(api_key=api_key, model=model)
+            else:
+                base_url = (
+                    self.ollama_base_url.text() or ""
+                ).strip() or "http://localhost:11434"
+                model = (self.ollama_model.text() or "").strip() or "llama3.1"
+                provider = LocalOllamaProvider(base_url=base_url, model=model)
+
+            # Test connection before continuing
+            ConnectionService(provider).test()
+
+        except Exception as e:
+            self.banner.show_error(str(e))
+            return
+
+        # pass settings forward
+        self._on_success(provider, target_lang, settings)
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/ui/pages/translate_page.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+
+from typing import Optional, Dict, Any
+
+from PyQt5.QtWidgets import (
+    QWidget,
+    QVBoxLayout,
+    QLabel,
+    QPushButton,
+    QHBoxLayout,
+    QTextEdit,
+    QProgressBar,
+    QFileDialog,
+)
+
+from ai_book_translator.infrastructure.io.read_document.base import ReadDocument
+from ai_book_translator.config.settings import Settings
+from ai_book_translator.domain.models import DocumentInput, MetadataResult
+from ai_book_translator.infrastructure.llm.base import LLMProvider
+
+from ..widgets.error_banner import ErrorBanner
+from ..workers.translation_worker import TranslationWorker
+
+
+class TranslatePage(QWidget):
+    def __init__(self, on_back):
+        super().__init__()
+        self._on_back = on_back
+        self._worker: Optional[TranslationWorker] = None
+        self._paused = False
+
+        root = QVBoxLayout()
+        root.setContentsMargins(22, 22, 22, 22)
+        root.setSpacing(14)
+
+        title = QLabel("Step 2 — Translation")
+        title.setStyleSheet("font-size: 22px; font-weight: 700;")
+
+        self.banner = ErrorBanner()
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+
+        self.stage = QLabel("")
+        self.stage.setStyleSheet("color: #666;")
+
+        self.output_preview = QTextEdit()
+        self.output_preview.setReadOnly(True)
+        self.output_preview.setPlaceholderText("Translation output will stream here…")
+
+        controls = QHBoxLayout()
+
+        btn_back = QPushButton("Back to input")
+        btn_back.clicked.connect(self._on_back)
+
+        self.btn_pause = QPushButton("Pause")
+        self.btn_pause.clicked.connect(self._toggle_pause)
+        self.btn_pause.setEnabled(False)
+
+        controls.addWidget(btn_back)
+        controls.addStretch(1)
+        controls.addWidget(self.btn_pause)
+
+        root.addWidget(title)
+        root.addWidget(self.banner)
+        root.addWidget(self.progress)
+        root.addWidget(self.stage)
+        root.addWidget(self.output_preview, 1)
+        root.addLayout(controls)
+
+        self.setLayout(root)
+
+    def start(
+        self,
+        provider: LLMProvider,
+        settings: Settings,
+        document: DocumentInput,
+        metadata_result: MetadataResult,
+        target_language: str,
+        resume_state: Optional[Dict[str, Any]] = None,
+        resume_state_path: Optional[str] = None,
+    ) -> None:
+        self.banner.hide()
+        self.progress.setValue(0)
+        self.stage.setText("")
+        self.output_preview.clear()
+
+        self.btn_pause.setEnabled(False)
+        self.btn_pause.setText("Pause")
+        self._paused = False
+
+        if provider is None:
+            self.banner.show_error("Provider is not configured.")
+            return
+        if document is None:
+            self.banner.show_error("No document provided.")
+            return
+        if metadata_result is None:
+            self.banner.show_error("No metadata available.")
+            return
+
+        # Ensure raw_text exists (extract if needed)
+        if document.raw_text is None and document.file_path:
+            try:
+                raw = ReadDocument.from_path(document.file_path).read(
+                    document.file_path
+                )
+                document = DocumentInput(file_path=document.file_path, raw_text=raw)
+            except Exception as e:
+                self.banner.show_error(f"Failed to extract text for translation: {e}")
+                return
+
+        # Decide output path:
+        # - if resuming: reuse output_txt_path from resume_state
+        # - else: ask user to choose it now
+        output_txt_path = None
+        if resume_state and isinstance(resume_state, dict):
+            output_txt_path = resume_state.get("output_txt_path")
+
+        if not output_txt_path:
+            meta = metadata_result.metadata or {}
+            title = meta.get("title") if isinstance(meta, dict) else None
+            if (
+                not isinstance(title, str)
+                or not title.strip()
+                or title == "not provided"
+            ):
+                title = "translation"
+            suggested = f"{title} ({target_language}).txt"
+
+            path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Choose where to save the translation (.txt will be written continuously)",
+                suggested,
+                "Text files (*.txt);;All files (*)",
+            )
+            if not path:
+                self.banner.show_error(
+                    "Translation cancelled: no output path selected."
+                )
+                return
+            output_txt_path = path
+
+        self._worker = TranslationWorker(
+            provider=provider,
+            settings=settings,
+            document=document,
+            metadata_result=metadata_result,
+            target_language=target_language,
+            output_txt_path=str(output_txt_path),
+            resume_state=resume_state,
+            resume_state_path=resume_state_path,
+        )
+        self._worker.progressed.connect(self._on_progress)
+        self._worker.chunk_done.connect(self._on_chunk_done)
+        self._worker.succeeded.connect(self._on_success)
+        self._worker.failed.connect(self._on_fail)
+        self._worker.start()
+
+        self.btn_pause.setEnabled(True)
+
+    def _on_progress(self, pct: int, stage: str) -> None:
+        self.progress.setValue(pct)
+        self.stage.setText(stage)
+
+    def _on_chunk_done(self, idx: int, text: str) -> None:
+        self.output_preview.append(text)
+        self.output_preview.append("\n" + ("-" * 40) + "\n")
+
+    def _on_success(self, _obj: object) -> None:
+        self.stage.setText("Translation complete.")
+        self.btn_pause.setEnabled(False)
+
+    def _on_fail(self, msg: str) -> None:
+        self.banner.show_error(msg)
+        self.btn_pause.setEnabled(False)
+
+    def _toggle_pause(self) -> None:
+        if not self._worker:
+            return
+        if not self._paused:
+            self._worker.request_pause()
+            self._paused = True
+            self.btn_pause.setText("Continue")
+            self.stage.setText("Paused")
+        else:
+            self._worker.request_resume()
+            self._paused = False
+            self.btn_pause.setText("Pause")
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/ui/widgets/__init__.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/ui/widgets/error_banner.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+
+from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import QWidget, QLabel, QHBoxLayout, QPushButton
+
+
+class ErrorBanner(QWidget):
+    def __init__(self):
+        super().__init__()
+        self._label = QLabel("")
+        self._label.setWordWrap(True)
+        self._label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        self._close = QPushButton("×")
+        self._close.setFixedWidth(32)
+        self._close.clicked.connect(self.hide)
+
+        layout = QHBoxLayout()
+        layout.addWidget(self._label, 1)
+        layout.addWidget(self._close, 0)
+        layout.setContentsMargins(10, 8, 10, 8)
+        self.setLayout(layout)
+
+        self.setStyleSheet("""
+            QWidget {
+                background: #3b1c1c;
+                border: 1px solid #7a2b2b;
+                border-radius: 8px;
+                color: #ffd7d7;
+            }
+            QPushButton {
+                background: transparent;
+                border: none;
+                font-size: 18px;
+                color: #ffd7d7;
+            }
+            QPushButton:hover { color: white; }
+        """)
+        self.hide()
+
+    def show_error(self, message: str) -> None:
+        self._label.setText(message)
+        self.show()
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/ui/widgets/progress_widget.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+
+from PyQt5.QtWidgets import QWidget, QLabel, QVBoxLayout, QProgressBar
+
+
+class ProgressWidget(QWidget):
+    def __init__(self, title: str = "Working..."):
+        super().__init__()
+        self._title = QLabel(title)
+        self._title.setStyleSheet("font-size: 18px; font-weight: 600;")
+
+        self._stage = QLabel("")
+        self._stage.setStyleSheet("color: #666;")
+        self._bar = QProgressBar()
+        self._bar.setRange(0, 100)
+        self._bar.setValue(0)
+
+        layout = QVBoxLayout()
+        layout.addWidget(self._title)
+        layout.addWidget(self._stage)
+        layout.addWidget(self._bar)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.setLayout(layout)
+
+    def set_stage(self, text: str) -> None:
+        self._stage.setText(text)
+
+    def set_progress(self, pct: int) -> None:
+        self._bar.setValue(max(0, min(100, int(pct))))
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/ui/workers/__init__.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/ui/workers/connection_worker.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+
+from PyQt5.QtCore import QThread, pyqtSignal
+
+from ai_book_translator.infrastructure.llm.base import LLMProvider
+from ai_book_translator.services.connection_service import ConnectionService
+
+
+class ConnectionWorker(QThread):
+    succeeded = pyqtSignal()
+    failed = pyqtSignal(str)
+
+    def __init__(self, provider: LLMProvider):
+        super().__init__()
+        self.provider = provider
+
+    def run(self) -> None:
+        try:
+            ConnectionService(self.provider).test()
+            self.succeeded.emit()
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/ui/workers/metadata_worker.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+
+from PyQt5.QtCore import QThread, pyqtSignal
+
+from ai_book_translator.config.settings import Settings
+from ai_book_translator.domain.models import DocumentInput, MetadataResult
+from ai_book_translator.infrastructure.llm.base import LLMProvider
+from ai_book_translator.services.metadata_service import MetadataService
+from ai_book_translator.infrastructure.persistence.metadata_cache import (
+    save_metadata_cache,
+)
+from ai_book_translator.infrastructure.persistence.translation_state import (
+    compute_document_hash,
+)
+
+try:
+    from ai_book_translator.infrastructure.io.read_document.base import ReadDocument
+except Exception:
+    ReadDocument = None
+
+
+class MetadataWorker(QThread):
+    progressed = pyqtSignal(int, str)  # pct, stage
+    succeeded = pyqtSignal(object)  # MetadataResult
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        provider: LLMProvider,
+        settings: Settings,
+        document: DocumentInput,
+        target_language: str,
+        display_name: str = "",
+    ):
+        super().__init__()
+        self.provider = provider
+        self.settings = settings
+        self.document = document
+        self.target_language = target_language
+        self.display_name = display_name or "document"
+
+    def run(self) -> None:
+        try:
+            self.progressed.emit(5, "Preparing document…")
+
+            doc = self.document
+            if doc.raw_text is None and doc.file_path and ReadDocument is not None:
+                try:
+                    txt = ReadDocument.from_path(doc.file_path).read(doc.file_path)
+                    doc = DocumentInput(file_path=doc.file_path, raw_text=txt)
+                except Exception:
+                    doc = self.document
+
+            self.progressed.emit(
+                15, f"Generating metadata JSON for {self.display_name}…"
+            )
+
+            svc = MetadataService(self.provider, self.settings)
+            res: MetadataResult = svc.generate_metadata(
+                doc, target_language=self.target_language
+            )
+
+            doc_hash = compute_document_hash(doc.raw_text or "")
+            title_hint = ""
+            try:
+                t = (res.metadata or {}).get("title")
+                if isinstance(t, str):
+                    title_hint = t
+            except Exception:
+                pass
+
+            p = save_metadata_cache(
+                document_hash=doc_hash,
+                metadata=dict(res.metadata or {}),
+                target_language=self.target_language,
+                title_hint=title_hint,
+            )
+            self.progressed.emit(95, f"Cached metadata: {p}")
+
+            self.progressed.emit(100, "Done")
+            self.succeeded.emit(res)
+
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./src/ai_book_translator/ui/workers/translation_worker.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from PyQt5.QtCore import QThread, pyqtSignal
+
+from ai_book_translator.config.settings import Settings
+from ai_book_translator.domain.models import DocumentInput, MetadataResult
+from ai_book_translator.infrastructure.llm.base import LLMProvider
+from ai_book_translator.services.chunking import chunk_by_chars
+from ai_book_translator.services.llm_json import chat_json_strict_with_repair
+from ai_book_translator.services.prompts import (
+    build_translation_system_prompt,
+    build_translation_user_prompt,
+)
+
+from ai_book_translator.infrastructure.persistence.translation_state import (
+    compute_document_hash,
+    make_state_path,
+    save_state,
+    delete_state,
+)
+
+
+class TranslationWorker(QThread):
+    progressed = pyqtSignal(int, str)
+    chunk_done = pyqtSignal(int, str)
+    succeeded = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        provider: LLMProvider,
+        settings: Settings,
+        document: DocumentInput,
+        metadata_result: MetadataResult,
+        target_language: str,
+        output_txt_path: str,
+        resume_state: Optional[Dict[str, Any]] = None,
+        resume_state_path: Optional[str] = None,
+    ):
+        super().__init__()
+        self.provider = provider
+        self.settings = settings
+        self.document = document
+        self.metadata_result = metadata_result
+        self.target_language = target_language
+        self.output_txt_path = output_txt_path
+        self.resume_state = resume_state or None
+        self.resume_state_path = resume_state_path or None
+        self._pause = False
+
+    def request_pause(self) -> None:
+        self._pause = True
+
+    def request_resume(self) -> None:
+        self._pause = False
+
+    def _write_header_if_needed(
+        self, fp, meta: Dict[str, Any], target_language: str
+    ) -> None:
+        # Only write header if file is empty.
+        try:
+            is_empty = fp.tell() == 0 and Path(self.output_txt_path).stat().st_size == 0
+        except Exception:
+            is_empty = fp.tell() == 0
+
+        if not is_empty:
+            return
+
+        lines: List[str] = []
+        lines.append(f"Title: {meta.get('title', 'not provided')}")
+        lines.append(f"Author(s): {meta.get('author(s)', 'not provided')}")
+        lines.append(f"Source language: {meta.get('language', 'not provided')}")
+        lines.append(f"Translated to: {target_language}")
+        lines.append("")
+        lines.append("=" * 80)
+        lines.append("")
+        fp.write("\n".join(lines))
+
+    def run(self) -> None:
+        try:
+            if self.document.raw_text is None:
+                raise RuntimeError(
+                    "No raw_text available for translation. Ensure PDF/TXT extraction is implemented."
+                )
+
+            raw_text = self.document.raw_text
+            doc_hash = compute_document_hash(raw_text)
+
+            chunks = chunk_by_chars(raw_text, self.settings.translation_chunk_chars)
+            total = max(1, len(chunks))
+
+            from ai_book_translator.infrastructure.persistence.metadata_cache import (
+                find_metadata_cache_by_hash,
+                load_metadata_cache,
+            )
+
+            # 1. Resolve metadata source (always prefer disk cache)
+            meta_path = find_metadata_cache_by_hash(doc_hash)
+            meta = {}
+            if meta_path:
+                try:
+                    record = load_metadata_cache(meta_path)
+                    if record and record.metadata:
+                        meta = dict(record.metadata)
+                except Exception:
+                    # Fallback to in-memory if disk load fails
+                    meta = dict(self.metadata_result.metadata or {})
+            else:
+                 meta = dict(self.metadata_result.metadata or {})
+
+            # Use all available metadata as context
+            opt_ctx: Dict[str, Any] = {}
+            for k in ["author(s)", "title", "summary", "chapters"]:
+                val = meta.get(k)
+                if val and val != "not provided":
+                    opt_ctx[k] = val
+
+            # Resume defaults
+            start_index = 0
+            current_chapter: Optional[str] = None
+            prev_tail = ""
+            
+            # --- IMPROVEMENT: Initialize current_chapter if starting fresh ---
+            if not self.resume_state:
+                 chapters_map = meta.get("chapters")
+                 if isinstance(chapters_map, dict) and chapters_map:
+                     # Pick the very first key as the starting chapter
+                     current_chapter = next(iter(chapters_map))
+            # -----------------------------------------------------------------
+
+            # Prepare output path early (needed for preflight state object)
+            out_path = Path(self.output_txt_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Determine state path
+            if self.resume_state_path:
+                state_path = Path(self.resume_state_path)
+            else:
+                title = meta.get("title")
+                state_path = make_state_path(
+                    title=title if isinstance(title, str) else None,
+                    doc_hash=doc_hash,
+                )
+
+            # If resume state exists and matches this document, apply it
+            if self.resume_state and isinstance(self.resume_state, dict):
+                if self.resume_state.get("document_hash") == doc_hash:
+                    try:
+                        start_index = int(
+                            self.resume_state.get("current_chunk_index") or 0
+                        )
+                    except Exception:
+                        start_index = 0
+
+                    ch0 = self.resume_state.get("current_chapter")
+                    current_chapter = (
+                        ch0 if isinstance(ch0, str) and ch0.strip() else None
+                    )
+
+                    t0 = self.resume_state.get("last_translation_tail")
+                    prev_tail = t0 if isinstance(t0, str) else ""
+
+                    # Prefer the previously used output path if it exists in state
+                    p0 = self.resume_state.get("output_txt_path")
+                    if isinstance(p0, str) and p0.strip():
+                        out_path = Path(p0)
+                        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Save a preflight state so resume works even if chunk 0 fails
+            preflight_state: Dict[str, Any] = {
+                "document_hash": doc_hash,
+                "output_txt_path": str(out_path),
+                "current_chunk_index": start_index,  # next chunk to translate
+                "chunks_total": total,
+                "current_chapter": current_chapter or "",
+                "last_translation_tail": prev_tail or "",
+                "metadata_path": str(meta_path) if meta_path else "",
+                "target_language": self.target_language,
+                "translation_chunk_chars": int(self.settings.translation_chunk_chars),
+                "updated_at_unix": int(time.time()),
+            }
+            save_state(state_path, preflight_state)
+
+            # Open output file in append mode (always incremental)
+            with open(out_path, "a", encoding="utf-8") as fp:
+                self._write_header_if_needed(fp, meta, self.target_language)
+
+                if start_index > 0:
+                    self.progressed.emit(
+                        int((start_index / total) * 100),
+                        f"Resuming from chunk {start_index + 1}/{total}…",
+                    )
+
+                for i in range(start_index, len(chunks)):
+                    while self._pause:
+                        self.msleep(150)
+
+                    pct = int(((i + 1) / total) * 100)
+                    self.progressed.emit(pct, f"Translating chunk {i+1}/{total}…")
+
+                    chunk = chunks[i]
+
+                    sys = build_translation_system_prompt(prev_tail)
+                    usr = build_translation_user_prompt(
+                        chunk_text=chunk,
+                        target_language=self.target_language,
+                        current_chapter=current_chapter,
+                        context=opt_ctx,
+                    )
+
+                    # TODO: ???
+                    obj = chat_json_strict_with_repair(
+                        provider=self.provider,
+                        system_prompt=sys,
+                        user_prompt=usr,
+                        repair_retries=2,
+                    )
+
+                    ch = obj.get("chapter")
+                    tr = obj.get("translation")
+
+                    if not isinstance(tr, str) or not tr.strip():
+                        raise RuntimeError(
+                            f"Model returned empty translation for chunk {i}."
+                        )
+
+                    if isinstance(ch, str) and ch.strip():
+                        current_chapter = ch.strip()
+
+                    # Append to output TXT immediately
+                    fp.write(tr.strip())
+                    fp.write("\n")
+                    fp.flush()
+
+                    prev_tail = chunk[-300:] if len(chunk) > 300 else chunk
+
+                    # Persist state after each successful chunk
+                    state_obj: Dict[str, Any] = {
+                        "document_hash": doc_hash,
+                        "output_txt_path": str(out_path),
+                        "current_chunk_index": i + 1,  # NEXT chunk to translate
+                        "chunks_total": total,
+                        "current_chapter": current_chapter or "",
+                        "last_translation_tail": prev_tail,
+                        "metadata_path": str(meta_path) if meta_path else "",
+                        "target_language": self.target_language,
+                        "translation_chunk_chars": int(
+                            self.settings.translation_chunk_chars
+                        ),
+                        "updated_at_unix": int(time.time()),
+                    }
+                    save_state(state_path, state_obj)
+
+                    self.chunk_done.emit(i, tr)
+
+            # Completed successfully -> delete state JSON
+            delete_state(state_path)
+
+            self.progressed.emit(100, "Done")
+            self.succeeded.emit({"ok": True, "output_txt_path": str(out_path)})
+
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./tests/test_chunking.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from ai_book_translator.services.chunking import chunk_by_chars
+
+def test_chunk_by_chars():
+    assert chunk_by_chars("abcdef", 2) == ["ab", "cd", "ef"]
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./tests/test_connection_service_integration.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+# Test success varies a lot from run to run, since LLMs are unpredictable in their response,
+# and max_tokens limit was set. Run multiple times or increase the limit if fails.
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+import os
+import socket
+import pytest
+
+from ai_book_translator.services.connection_service import ConnectionService
+
+# Update these imports if your filenames differ:
+from ai_book_translator.infrastructure.llm.openai_provider import (
+    OpenAIResponsesProvider,
+)
+from ai_book_translator.infrastructure.llm.local_provider import LocalOllamaProvider
+
+
+def _host_port_reachable(url: str, timeout: float = 0.5) -> bool:
+    """
+    Quick TCP reachability check for URLs like http://localhost:11434
+    (avoid hanging tests if Ollama isn't running).
+    """
+    try:
+        # naive parse: http(s)://host:port
+        url = url.replace("https://", "").replace("http://", "")
+        host_port = url.split("/")[0]
+        host, port_str = host_port.split(":")
+        port = int(port_str)
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+@pytest.mark.integration
+def test_connection_service_openai_from_env():
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        pytest.skip("OPENAI_API_KEY not set")
+
+    provider = OpenAIResponsesProvider(api_key=api_key, model="gpt-5-nano")
+    ConnectionService(provider).test()
+
+
+@pytest.mark.integration
+def test_connection_service_ollama_from_env():
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    model = os.getenv("OLLAMA_MODEL")
+
+    if not _host_port_reachable(base_url):
+        pytest.skip(
+            f"Ollama not reachable at {base_url} (set OLLAMA_BASE_URL or start Ollama)"
+        )
+
+    provider = LocalOllamaProvider(base_url=base_url, model=model)
+    ConnectionService(provider).test()
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./tests/test_json_parsing.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./tests/test_metadata_service.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+import pytest
+
+from ai_book_translator.services.metadata_service import MetadataService
+from ai_book_translator.config.settings import Settings
+from ai_book_translator.domain.models import DocumentInput
+from ai_book_translator.infrastructure.llm.exceptions import (
+    UploadNotSupportedError,
+    TransientLLMError,
+    DocumentReadError,
+    InvalidJSONError,
+)
+
+
+class FakeProvider:
+    """
+    Provider stub with scripted behavior.
+    Set these attributes in tests to control responses.
+    """
+
+    def __init__(self):
+        self.chat_text_calls = []
+        self.chat_doc_calls = []
+
+        self.doc_behaviors = []  # list of either dict result or exception
+        self.text_behaviors = []  # list of str results (for chunk summaries)
+        self.repair_behaviors = (
+            []
+        )  # list of dict results (for json repair / summary-of-summaries)
+
+    def test_connection(self) -> None:
+        return None
+
+    def chat_text(self, system_prompt: str, user_prompt: str, **kwargs):
+        self.chat_text_calls.append((system_prompt, user_prompt, kwargs))
+        if not self.text_behaviors:
+            return ""
+        return self.text_behaviors.pop(0)
+
+    def chat_text_with_document(
+        self, system_prompt: str, user_prompt: str, file_path: str, **kwargs
+    ):
+        self.chat_doc_calls.append((system_prompt, user_prompt, file_path, kwargs))
+        if not self.doc_behaviors:
+            raise UploadNotSupportedError("no scripted upload result")
+        b = self.doc_behaviors.pop(0)
+        if isinstance(b, Exception):
+            raise b
+        # metadata_service expects raw string, then parse_json_strict will parse it;
+        # in tests we monkeypatch parse_json_strict so we can return dict directly or use str.
+        return b
+
+
+@pytest.fixture
+def settings():
+    # Build with overrides (works for frozen dataclasses)
+    return Settings(
+        upload_retries=2,
+        json_repair_retries=1,
+        translation_chunk_chars=30000,
+        local_metadata_chunk_chars=20,
+        local_metadata_first_chunks_with_title_author_hint=1,
+        max_chunk_summaries_for_summary_of_summaries=3,
+    )
+
+
+def _stub_schema_helpers(monkeypatch):
+    # Make schema helpers no-ops for unit testing.
+    monkeypatch.setattr(
+        "ai_book_translator.services.metadata_service.validate_metadata_json",
+        lambda meta: None,
+    )
+    monkeypatch.setattr(
+        "ai_book_translator.services.metadata_service.normalize_not_provided",
+        lambda meta: meta,
+    )
+
+
+def test_upload_success(monkeypatch, settings):
+    _stub_schema_helpers(monkeypatch)
+
+    provider = FakeProvider()
+    provider.doc_behaviors = ["RAW_JSON"] 
+    svc = MetadataService(provider, settings)
+
+    # provider returns "raw json string"; parse_json_strict -> dict
+    monkeypatch.setattr(
+        "ai_book_translator.services.metadata_service.parse_json_strict",
+        lambda raw: {
+            "author(s)": "A",
+            "title": "T",
+            "language": "en",
+            "summary": "S",
+            "chapters": {
+                "ch1": {"general": "g1", "detailed": "d1"}
+            },
+        },
+    )
+
+    doc = DocumentInput(file_path="book.pdf", raw_text=None)
+    res = svc.generate_metadata(doc, target_language="uk")
+
+    assert res.strategy_used == "upload"
+    assert res.fallback_reason is None
+    assert res.metadata["target_language"] == "uk"
+    assert provider.chat_doc_calls, "expected upload call"
+
+
+def test_upload_not_supported_falls_back_to_chunked(monkeypatch, settings):
+    _stub_schema_helpers(monkeypatch)
+
+    provider = FakeProvider()
+    svc = MetadataService(provider, settings)
+
+    # Upload fails
+    provider.doc_behaviors = [UploadNotSupportedError("no upload")]
+
+    # Chunk summaries (3 max)
+    provider.text_behaviors = ["sum1", "sum2", "sum3"]
+
+    # summary-of-summaries JSON result
+    monkeypatch.setattr(
+        "ai_book_translator.services.metadata_service.chat_json_strict_with_repair",
+        lambda **kwargs: {
+            "author(s)": "A",
+            "title": "T",
+            "language": "en",
+            "summary": "S",
+            "chapters": {},
+        },
+    )
+
+    doc = DocumentInput(
+        file_path="book.pdf", raw_text="This is a book text that will be chunked."
+    )
+    res = svc.generate_metadata(doc, target_language="pl")
+
+    assert res.strategy_used == "chunked"
+    assert "no upload" in (res.fallback_reason or "")
+    assert res.metadata["target_language"] == "pl"
+    assert provider.chat_text_calls, "expected chunk summarization calls"
+
+
+def test_no_file_path_uses_chunked(monkeypatch, settings):
+    _stub_schema_helpers(monkeypatch)
+
+    provider = FakeProvider()
+    svc = MetadataService(provider, settings)
+
+    provider.text_behaviors = ["sum1", "sum2", "sum3"]
+    monkeypatch.setattr(
+        "ai_book_translator.services.metadata_service.chat_json_strict_with_repair",
+        lambda **kwargs: {
+            "author(s)": "A",
+            "title": "T",
+            "language": "en",
+            "summary": "S",
+            "chapters": {},
+        },
+    )
+
+    doc = DocumentInput(file_path=None, raw_text="Some long book text here...")
+    res = svc.generate_metadata(doc, target_language="de")
+
+    assert res.strategy_used == "chunked"
+    assert res.fallback_reason == "no file provided for upload"
+    assert res.metadata["target_language"] == "de"
+
+
+def test_chunked_requires_raw_text(monkeypatch, settings):
+    _stub_schema_helpers(monkeypatch)
+
+    provider = FakeProvider()
+    svc = MetadataService(provider, settings)
+
+    doc = DocumentInput(file_path=None, raw_text=None)
+
+    with pytest.raises(DocumentReadError):
+        svc.generate_metadata(doc, target_language="en")
+
+
+def test_upload_transient_retry_then_success(monkeypatch, settings):
+    _stub_schema_helpers(monkeypatch)
+
+    provider = FakeProvider()
+    svc = MetadataService(provider, settings)
+
+    # First call transient, second call succeeds
+    provider.doc_behaviors = [
+        TransientLLMError("timeout"),
+        "RAW_JSON",
+    ]
+
+    monkeypatch.setattr(
+        "ai_book_translator.services.metadata_service.parse_json_strict",
+        lambda raw: {
+            "author(s)": "A",
+            "title": "T",
+            "language": "en",
+            "summary": "S",
+            "chapters": {},
+        },
+    )
+
+    doc = DocumentInput(file_path="book.pdf", raw_text="fallback text just in case")
+    res = svc.generate_metadata(doc, target_language="uk")
+
+    assert res.strategy_used == "upload"
+    assert len(provider.chat_doc_calls) == 2, "should retry once then succeed"
+    assert res.metadata["target_language"] == "uk"
+
+
+def test_upload_invalid_json_triggers_repair(monkeypatch, settings):
+    _stub_schema_helpers(monkeypatch)
+
+    provider = FakeProvider()
+    svc = MetadataService(provider, settings)
+
+    # We need TWO responses:
+    # 1. The first call (structured output attempt) returns invalid JSON.
+    # 2. The code catches that exception and calls chat_text_with_document AGAIN (fallback prompt mode).
+    #    That second call also returns "NOT_JSON" (or whatever).
+    # 3. Then parse_json_strict fails again, and it calls chat_json_strict_with_repair.
+    provider.doc_behaviors = ["NOT_JSON", "NOT_JSON"]
+
+    def parse_fail(_raw):
+        raise InvalidJSONError("bad json")
+
+    monkeypatch.setattr(
+        "ai_book_translator.services.metadata_service.parse_json_strict", parse_fail
+    )
+
+    # Repair returns valid dict
+    monkeypatch.setattr(
+        "ai_book_translator.services.metadata_service.chat_json_strict_with_repair",
+        lambda **kwargs: {
+            "author(s)": "A",
+            "title": "T",
+            "language": "en",
+            "summary": "S",
+            "chapters": {
+                "Chapter 1": {
+                    "general": "The beginning.",
+                    "detailed": "A very detailed summary of the beginning."
+                }
+            },
+        },
+    )
+
+    doc = DocumentInput(file_path="book.pdf", raw_text="fallback text")
+    res = svc.generate_metadata(doc, target_language="es")
+
+    assert res.strategy_used == "upload"
+    assert res.metadata["target_language"] == "es"
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./tests/test_prompt_rules.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./tests/test_prompts_new.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+from ai_book_translator.services.prompts import build_translation_user_prompt
+
+def test_chapter_formatting():
+    context = {
+        "title": "Test Book",
+        "author(s)": "Test Author",
+        "summary": "Test Summary",
+        "chapters": {
+            "Chapter 1": {"general": "Short summary 1", "detailed": "Detailed summary 1"},
+            "Chapter 2": {"general": "Short summary 2", "detailed": "Detailed summary 2"},
+            "Chapter 3": {"general": "Short summary 3", "detailed": "Detailed summary 3"},
+        }
+    }
+    
+    # Test 1: Current chapter is "Chapter 2"
+    prompt = build_translation_user_prompt(
+        chunk_text="Some text",
+        target_language="Ukrainian",
+        current_chapter="Chapter 2",
+        context=context
+    )
+    
+    print(prompt)
+    
+    # Expectation: 
+    # - Chapter 1 - Short summary 1
+    # - Chapter 2 - Detailed summary 2
+    # - Chapter 3 - Short summary 3
+    
+    assert "- Chapter 1 - Short summary 1" in prompt
+    assert "- Chapter 2 - Detailed summary 2" in prompt
+    assert "- Chapter 3 - Short summary 3" in prompt
+    
+    # Ensure "Detailed summary 1" is NOT in prompt
+    assert "Detailed summary 1" not in prompt
+
+def test_chapter_formatting_no_current_chapter():
+    context = {
+        "chapters": {
+            "Chapter 1": {"general": "Short summary 1", "detailed": "Detailed summary 1"},
+        }
+    }
+    
+    prompt = build_translation_user_prompt(
+        chunk_text="Some text",
+        target_language="Ukrainian",
+        current_chapter=None,
+        context=context
+    )
+    
+    # Expectation:
+    # - Chapter 1 - Short summary 1 (since current is None, none match)
+    
+    assert "- Chapter 1 - Short summary 1" in prompt
+    assert "Detailed summary 1" not in prompt
+
+def test_chapter_formatting_numeric_string_mismatch():
+    context = {
+        "chapters": {
+            "Chapter 1": {"general": "Short summary 1", "detailed": "Detailed summary 1"},
+        }
+    }
+    
+    # If current_chapter is "1" but key is "Chapter 1", exact match fails, so it uses general.
+    # This is current expected behavior unless I implemented fuzzy matching (which I didn't).
+    prompt = build_translation_user_prompt(
+        chunk_text="Some text",
+        target_language="Ukrainian",
+        current_chapter="1",
+        context=context
+    )
+    
+    assert "- Chapter 1 - Short summary 1" in prompt
+
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# FILE: ./tests/test_read_document.py
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+import pytest
+from pathlib import Path
+
+from ai_book_translator.infrastructure.io.read_document.base import ReadDocument
+from ai_book_translator.infrastructure.io.read_document.text_reader import TextReader
+from ai_book_translator.infrastructure.io.read_document.pdf_reader import PdfReader
+
+
+def test_read_document_is_abstract():
+    # Abstract classes can't be instantiated directly
+    with pytest.raises(TypeError):
+        ReadDocument()  # type: ignore
+
+
+def test_from_path_selects_text_reader(tmp_path: Path):
+    p = tmp_path / "book.txt"
+    p.write_text("Hello world", encoding="utf-8")
+
+    reader = ReadDocument.from_path(p)
+    assert isinstance(reader, TextReader)
+    assert reader.read(p) == "Hello world"
+
+
+def test_from_path_selects_pdf_reader(tmp_path: Path):
+    # Create a real PDF containing text using reportlab (installed in your environment)
+    from reportlab.pdfgen import canvas
+
+    pdf_path = tmp_path / "book.pdf"
+    c = canvas.Canvas(str(pdf_path))
+    c.drawString(72, 720, "PDF hello")  # 1 inch margin, near top
+    c.save()
+
+    reader = ReadDocument.from_path(pdf_path)
+    assert isinstance(reader, PdfReader)
+
+    text = reader.read(pdf_path)
+    # pypdf extraction sometimes includes extra whitespace/newlines
+    assert "PDF hello" in text
+
+
+def test_from_path_unsupported_extension_raises(tmp_path: Path):
+    p = tmp_path / "book.epub"
+    p.write_text("fake", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        ReadDocument.from_path(p)
