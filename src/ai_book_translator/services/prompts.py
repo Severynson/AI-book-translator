@@ -218,11 +218,9 @@ def build_translation_user_prompt(
 
         # Dynamic Chapter List
         chapters = context.get("chapters")
-        print("CHAPTERS --->", chapters)
         if isinstance(chapters, dict) and chapters:
             chapter_lines = []
             for ch_id, ch_data in chapters.items():
-                print("CHAPTER ID:", ch_id, "\nCHAPTER DATA:", ch_data)
                 if not isinstance(ch_data, dict):
                     continue
 

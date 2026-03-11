@@ -1,9 +1,11 @@
 from __future__ import annotations
-from ..infrastructure.llm.base import LLMProvider
+
+from ..infrastructure.llm.client import LLMClient
+
 
 class ConnectionService:
-    def __init__(self, provider: LLMProvider):
-        self.provider = provider
+    def __init__(self, client: LLMClient):
+        self._client = client
 
     def test(self) -> None:
-        self.provider.test_connection()
+        self._client.test_connection()

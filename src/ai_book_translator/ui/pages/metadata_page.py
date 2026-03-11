@@ -13,7 +13,7 @@ from PyQt5.QtWidgets import (
 
 from ai_book_translator.config.settings import Settings
 from ai_book_translator.domain.models import DocumentInput, MetadataResult
-from ai_book_translator.infrastructure.llm.base import LLMProvider
+from ai_book_translator.infrastructure.llm.client import LLMClient
 
 from ..widgets.error_banner import ErrorBanner
 from ..widgets.progress_widget import ProgressWidget
@@ -34,7 +34,7 @@ class MetadataPage(QWidget):
         root.setContentsMargins(22, 22, 22, 22)
         root.setSpacing(14)
 
-        title = QLabel("Step 1 — Metadata extraction")
+        title = QLabel("Step 3 — Metadata extraction")
         title.setStyleSheet("font-size: 22px; font-weight: 700;")
 
         self.banner = ErrorBanner()
@@ -65,7 +65,7 @@ class MetadataPage(QWidget):
 
     def start(
         self,
-        provider: LLMProvider,
+        client: LLMClient,
         settings: Settings,
         document: DocumentInput,
         target_language: str,
@@ -77,7 +77,7 @@ class MetadataPage(QWidget):
         self.btn_continue.setEnabled(False)
         self._last_result = None
 
-        if provider is None:
+        if client is None:
             self.banner.show_error("Provider is not configured.")
             return
         if document is None:
@@ -91,7 +91,7 @@ class MetadataPage(QWidget):
             display_name = "pasted text"
 
         self._worker = MetadataWorker(
-            provider=provider,
+            client=client,
             settings=settings,
             document=document,
             target_language=target_language,

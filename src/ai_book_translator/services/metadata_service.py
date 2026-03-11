@@ -1,19 +1,19 @@
 from __future__ import annotations
+
 from typing import Any, List
 
 from ..config.settings import Settings
 from ..domain.models import DocumentInput, MetadataResult
 from ..domain.schemas import validate_metadata_json, normalize_not_provided
-from ..infrastructure.llm.base import LLMProvider
+from ..infrastructure.llm.client import LLMClient
+from ..infrastructure.llm.types import LLMRequest
 from ..infrastructure.llm.exceptions import (
     UploadNotSupportedError,
     UploadFailedError,
     TransientLLMError,
     DocumentReadError,
 )
-from ..infrastructure.llm.json_parser import parse_json_strict
-from ..infrastructure.llm.exceptions import InvalidJSONError
-from .chunking import chunk_by_chars
+from .llm_json_client import LLMJsonClient
 from .prompts import (
     METADATA_SYSTEM_PROMPT,
     METADATA_USER_PROMPT_UPLOAD,
@@ -23,21 +23,58 @@ from .prompts import (
     SUMMARY_OF_SUMMARIES_SYSTEM_PROMPT,
     build_summary_of_summaries_user_prompt,
 )
-from .llm_json import chat_json_strict_with_repair
+from .chunking import chunk_by_chars
+
+
+METADATA_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["author(s)", "title", "language", "summary", "chapters"],
+    "properties": {
+        "author(s)": {"type": "string"},
+        "title": {"type": "string"},
+        "language": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "summary": {"type": "string"},
+        "chapters": {
+            "type": "object",
+            "additionalProperties": {
+                "type": "object",
+                "properties": {
+                    "general": {"type": "string"},
+                    "detailed": {"type": "string"},
+                },
+                "required": ["general", "detailed"],
+                "additionalProperties": False,
+            },
+        },
+    },
+}
 
 
 class MetadataService:
-    def __init__(self, provider: LLMProvider, settings: Settings):
-        self.provider = provider
-        self.settings = settings
+    def __init__(self, client: LLMClient, settings: Settings):
+        self._client = client
+        self._settings = settings
+        self._json_client = LLMJsonClient(client, settings.json_repair_retries)
 
     def generate_metadata(
         self, doc: DocumentInput, target_language: str, **kwargs: Any
     ) -> MetadataResult:
-        # Attempt upload-first if file_path is provided
-        if doc.file_path:
+        caps = self._client.capabilities()
+
+        # Upload-first if file_path provided AND provider supports upload
+        if doc.file_path and caps.supports_file_upload:
             try:
-                meta = self._upload_metadata(doc.file_path, **kwargs)
+                meta = self._json_client.generate_json(
+                    system_prompt=METADATA_SYSTEM_PROMPT,
+                    user_prompt=METADATA_USER_PROMPT_UPLOAD,
+                    file_path=doc.file_path,
+                    json_schema=METADATA_SCHEMA,
+                    max_tokens=2000,
+                )
                 meta = normalize_not_provided(meta)
                 validate_metadata_json(meta)
                 meta["target_language"] = target_language
@@ -45,13 +82,19 @@ class MetadataService:
 
             except (UploadNotSupportedError, UploadFailedError) as e:
                 return self._chunked_fallback(
-                    doc, target_language, reason=str(e), **kwargs
+                    doc, target_language, reason=str(e)
                 )
 
             except TransientLLMError:
-                for _ in range(self.settings.upload_retries):
+                for _ in range(self._settings.upload_retries):
                     try:
-                        meta = self._upload_metadata(doc.file_path, **kwargs)
+                        meta = self._json_client.generate_json(
+                            system_prompt=METADATA_SYSTEM_PROMPT,
+                            user_prompt=METADATA_USER_PROMPT_UPLOAD,
+                            file_path=doc.file_path,
+                            json_schema=METADATA_SCHEMA,
+                            max_tokens=2000,
+                        )
                         meta = normalize_not_provided(meta)
                         validate_metadata_json(meta)
                         meta["target_language"] = target_language
@@ -60,135 +103,47 @@ class MetadataService:
                         continue
                     except (UploadNotSupportedError, UploadFailedError) as e:
                         return self._chunked_fallback(
-                            doc, target_language, reason=str(e), **kwargs
+                            doc, target_language, reason=str(e)
                         )
                 return self._chunked_fallback(
-                    doc, target_language, reason="upload transient failure", **kwargs
+                    doc, target_language, reason="upload transient failure"
                 )
 
-        # No file_path => direct fallback (pasted text flow)
-        return self._chunked_fallback(
-            doc, target_language, reason="no file provided for upload", **kwargs
-        )
-
-    def _upload_metadata(self, file_path: str, **kwargs: Any) -> dict:
-        system = METADATA_SYSTEM_PROMPT
-        user = METADATA_USER_PROMPT_UPLOAD
-
-        METADATA_SCHEMA = {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["author(s)", "title", "language", "summary", "chapters"],
-            "properties": {
-                "author(s)": {"type": "string"},
-                "title": {"type": "string"},
-                "language": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                },
-                "summary": {"type": "string"},
-                "chapters": {
-                    "type": "object",
-                    "additionalProperties": {
-                        "type": "object",
-                        "properties": {
-                            "general": {"type": "string"},
-                            "detailed": {"type": "string"},
-                        },
-                        "required": ["general", "detailed"],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-        }
-
-        # 1) Golden standard attempt: schema-enforced output (OpenAI)
-        raw = None
-        try:
-            raw = self.provider.chat_text_with_document(
-                system_prompt=system,
-                user_prompt=user,
-                file_path=file_path,
-                text={
-                    "format": {
-                        "type": "json_schema",
-                        "strict": True,
-                        "name": "book_metadata",
-                        "schema": METADATA_SCHEMA,
-                    }
-                },
-                max_output_tokens=2000,
-                **kwargs,
-            )
-        except (UploadNotSupportedError, UploadFailedError, TransientLLMError):
-            # Critical errors should bubble up to generate_metadata handler
-            raise
-        except Exception:
-            # Other errors (e.g. model doesn't support structured outputs): fall back to prompt-only
-            raw = None
-
-        # If schema-mode produced something, try parsing it directly
-        if raw:
-            try:
-                return parse_json_strict(raw)
-            except InvalidJSONError:
-                pass  # fall through to prompt-only repair
-
-        # 2) Fallback: prompt-enforced JSON (no schema formatting)
-        # (Still strict, plus repair loop)
-        raw2 = self.provider.chat_text_with_document(
-            system_prompt=system,
-            user_prompt=user,
-            file_path=file_path,
-            max_output_tokens=2000,
-            **kwargs,
-        )
-
-        # Parse; if invalid, repair via normal chat (no re-upload)
-        try:
-            return parse_json_strict(raw2)
-        except InvalidJSONError:
-            return chat_json_strict_with_repair(
-                provider=self.provider,
-                system_prompt=system,
-                user_prompt=METADATA_REPAIR_PROMPT + raw2,
-                repair_retries=self.settings.json_repair_retries,
-                **kwargs,
-            )
+        # No file_path or no upload support → direct chunked fallback
+        reason = "no file provided for upload"
+        if doc.file_path and not caps.supports_file_upload:
+            reason = "provider does not support file upload"
+        return self._chunked_fallback(doc, target_language, reason=reason)
 
     def _chunked_fallback(
-        self, doc: DocumentInput, target_language: str, reason: str, **kwargs: Any
+        self, doc: DocumentInput, target_language: str, reason: str
     ) -> MetadataResult:
         if doc.raw_text is None:
             raise DocumentReadError(
                 "Chunked fallback requires raw_text (extract the document first)."
             )
 
-        chunks = chunk_by_chars(doc.raw_text, self.settings.local_metadata_chunk_chars)
+        chunks = chunk_by_chars(doc.raw_text, self._settings.local_metadata_chunk_chars)
 
         chunk_summaries: List[str] = []
         for i, ch in enumerate(
-            chunks[: self.settings.max_chunk_summaries_for_summary_of_summaries]
+            chunks[: self._settings.max_chunk_summaries_for_summary_of_summaries]
         ):
             is_early = (
-                i < self.settings.local_metadata_first_chunks_with_title_author_hint
+                i < self._settings.local_metadata_first_chunks_with_title_author_hint
             )
-            sys = LOCAL_CHUNK_SUMMARY_SYSTEM_PROMPT
-            usr = build_local_chunk_summary_user_prompt(ch, is_early_chunk=is_early)
-            s = self.provider.chat_text(
-                system_prompt=sys, user_prompt=usr, **kwargs
-            ).strip()
-            chunk_summaries.append(s)
+            request = LLMRequest(
+                system_prompt=LOCAL_CHUNK_SUMMARY_SYSTEM_PROMPT,
+                user_prompt=build_local_chunk_summary_user_prompt(
+                    ch, is_early_chunk=is_early
+                ),
+            )
+            resp = self._client.generate_text(request)
+            chunk_summaries.append(resp.text.strip())
 
-        system = SUMMARY_OF_SUMMARIES_SYSTEM_PROMPT
-        user = build_summary_of_summaries_user_prompt(chunk_summaries)
-
-        meta = chat_json_strict_with_repair(
-            provider=self.provider,
-            system_prompt=system,
-            user_prompt=user,
-            repair_retries=self.settings.json_repair_retries,
-            **kwargs,
+        meta = self._json_client.generate_json(
+            system_prompt=SUMMARY_OF_SUMMARIES_SYSTEM_PROMPT,
+            user_prompt=build_summary_of_summaries_user_prompt(chunk_summaries),
         )
 
         meta = normalize_not_provided(meta)

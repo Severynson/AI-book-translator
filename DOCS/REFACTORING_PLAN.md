@@ -27,6 +27,7 @@ The system must preserve:
 - all already translated content
 - exact resume position (`next_chunk_index`)
 - all context needed to continue with the same prompt state (`current_chapter`, previous-tail context, model config snapshot)
+- all prompt customizations needed to continue with the same translation behavior (`system_prompt_customization`, per-run custom translation instruction, chunk-boundary repair settings)
 
 Resume behavior target:
 
@@ -35,6 +36,21 @@ Resume behavior target:
   P.S. Make sure that path stored in metadata JSONs is absolute, so even if the doc to translate is in downloads - it could be easily loaded again using absolute path to continue translation.
 - no silent data loss.
 - IMPORTANT: no duplicated chunk output in final document! Make sure to avoid this bug!
+
+Additional resume/continuity requirement:
+
+- Translation must build on top of the already existing backward soft chunk split and still handle chunk boundaries where the final sentence is incomplete.
+- The prompt contract must explicitly tell the model not to "complete" or over-translate a sentence beyond the text available in the current chunk.
+- The next chunk must be translated with enough context to detect that it may begin in the middle of a sentence continued from the previous chunk.
+- Users must be able to define custom translation instructions and system-prompt additions, and those instructions must be stored in the translation-state JSON so resume uses the exact same behavior.
+- The model must be allowed to explicitly react to both related cases:
+  - the current chunk ends with an interrupted sentence
+  - the previous chunk tail was translated badly and should be replaced now that more context is available
+- The system must support both:
+  - structured JSON repair output when the backend supports schema/JSON output
+  - a deterministic text-marker fallback when the backend does not
+- In either mode, the next chunk must be able to flag that the previous chunk ending was translated incorrectly because context was missing, provide the corrected replacement, and then continue with the current chunk.
+- Translation-time errors should be classified so potentially prompt-fixable failures can open an LLM-assisted popup for the user, while clear internal/code failures continue through normal error handling only.
 
 ---
 
@@ -89,22 +105,28 @@ Impact:
 - JSON parse/repair logic is split between `services/llm_json.py` and metadata service upload flow.
 - Retry logic exists in both provider (`OpenAIResponsesProvider._post_json`) and service (`upload_retries` loop).
 - Local provider has much weaker retry behavior than OpenAI provider.
+- There is no formal path yet for "model probably can be fixed by changing prompt" versus "this is an internal/code failure and should not involve the model".
 
 Impact:
 
 - Inconsistent reliability and hidden retry amplification.
 - Hard to reason about failure semantics.
+- UI cannot yet distinguish when an LLM-guided recovery suggestion is appropriate.
 
 ### 2.6 Resume/state handling exists but is not a formal contract
 
 - Current translation flow already saves preflight state and per-chunk state updates.
 - But state semantics are tightly coupled to worker flow and not defined as a strict, testable checkpoint protocol.
 - Recovery correctness is not documented as a consistency model (write ordering, idempotency, crash boundaries).
+- Chunking already prefers natural split boundaries, but that behavior is not documented as an explicit precondition for translation continuity logic.
+- Prompt continuity rules for interrupted sentences and re-translation of a damaged previous-chunk tail are not formalized.
+- Custom translation instructions are not formalized as part of persisted run state.
 
 Impact:
 
 - Resume may work in common cases but is harder to prove correct under edge failures.
 - Future refactors risk breaking recovery guarantees.
+- Prompt behavior may drift after resume, especially for non-standard translation tasks.
 
 ### 2.7 Architectural drift / stale artifacts
 
@@ -139,6 +161,7 @@ Use four layers:
 
 - A provider-agnostic client API with typed requests/responses.
 - Handles capabilities, retries, JSON/schema enforcement strategy.
+- Carries prompt customization fields as first-class request/state data instead of ad hoc string concatenation in UI code.
 
 4. **Provider Adapters Layer**
 
@@ -146,6 +169,18 @@ Use four layers:
 - Only place that knows endpoint shape (`/v1/responses` vs `/v1/chat/completions`, file upload, etc).
 
 This isolates differences where they belong.
+
+Translation-prompt behavior should also be separated cleanly:
+
+- prompt template structure lives in the services/prompt layer
+- stateful prompt inputs (previous tail, custom instruction, repair marker config) live in translation state
+- provider adapters only transmit the final prompt payload
+
+Error-handling behavior should also be separated cleanly:
+
+- low-level exceptions are classified in the services layer
+- only a narrow subset of prompt-fixable failures may invoke LLM-assisted user guidance
+- UI only renders the popup and captures the user's choice
 
 ---
 
@@ -215,6 +250,13 @@ Example component:
 
 This removes JSON-handling duplication from metadata and translation flows.
 
+Required JSON fallback behavior:
+
+- If backend schema mode is supported, use it first.
+- If backend schema mode is not supported, explicitly append strict JSON-return instructions to the system prompt and/or user prompt and try to parse the response as JSON anyway.
+- If parsing fails, run the bounded JSON repair flow.
+- Only if prompt-enforced JSON plus repair still cannot produce a valid object should the system fall back to the deterministic text-marker protocol.
+
 ### 5.3 Move translation orchestration into `TranslationService`
 
 `TranslationWorker` should only:
@@ -273,6 +315,12 @@ Define a dedicated translation state contract owned by `TranslationService` (not
 - `chunks_total`
 - `current_chapter`
 - `previous_tail`
+- `previous_chunk_tail_source`
+- `system_prompt_customization`
+- `translation_instruction`
+- `boundary_repair_marker`
+- `last_committed_chunk_tail_translation`
+- `last_committed_chunk_tail_status` (`clean`, `possibly_truncated`, `repaired`)
 - `output_mode` metadata (single-file or chunk-files)
 - `updated_at_unix`
 - optional `last_error` snapshot for diagnostics
@@ -297,6 +345,8 @@ Define a dedicated translation state contract owned by `TranslationService` (not
 - verify provider/model compatibility (warn on mismatch)
 - resume from `next_chunk_index`
 - preserve already translated content exactly as committed
+- restore prompt customization exactly from checkpoint JSON, not from current UI defaults
+- restore previous-tail analysis so the first resumed chunk can still repair a damaged previous chunk ending if needed
 
 Deliverable: resume behavior is explicitly defined and testable before broader refactor.
 
@@ -316,6 +366,104 @@ Why:
 
 If keeping monolithic output, add output offset/hash ledger to detect duplicate writes on resume.
 
+### Phase 0.2 (required): define chunk-boundary translation contract before prompt refactor
+
+Add a documented contract for translation prompts and post-processing:
+
+1. Current-chunk ending rule:
+
+- Keep the existing chunker behavior that walks backward from preferred chunk length to find natural split points such as paragraph boundaries, sentence-ending punctuation, separators, or spaces before falling back to a hard cut.
+- If the final sentence in a chunk is obviously incomplete, the model must not complete it using guessed text.
+- The model may translate only the portion actually present in the chunk.
+- The service should mark that chunk tail as `possibly_truncated` in checkpoint state.
+
+2. Next-chunk opening rule:
+
+- Every chunk after the first should receive a bounded amount of previous-chunk tail context.
+- The prompt must tell the model to check whether the new chunk starts by continuing an interrupted sentence.
+- If so, the model should begin by translating from the sentence continuation point instead of treating the opening as a fresh sentence with no history.
+
+3. Previous-tail repair rule:
+
+- If the model can infer either that:
+  - the current chunk ends with an interrupted sentence
+  - or the previous chunk's ending was translated poorly because the sentence was incomplete or lacked sufficient following context
+  it may emit a repair-aware response first.
+- Prefer structured JSON output whenever the backend supports it.
+- Recommended JSON shape:
+  - `chapter`: current chapter identifier
+  - `translation`: normal translation output for the current chunk
+  - optional `tail_status`: for example `clean` or `possibly_truncated`
+  - optional `repair_previous_fragment`: exact old translated trailing fragment that should be removed from already committed output
+  - optional `repair_retranslation`: corrected translation that should replace that previous fragment before appending `translation`
+- For backends without schema mode, still instruct the model in the system prompt to return strict JSON only, with no commentary, and attempt normal JSON parsing plus JSON-repair retries.
+- Only after JSON parsing/recovery fails should the system use a deterministic unique marker sequence stored in state (for example `|||RETRANSLATE_PREVIOUS|||` plus a quoted old fragment), chosen specifically to avoid normal book text collisions.
+- In both modes, the repair payload must identify the old translated fragment to replace, provide the corrected text, and then continue with the current chunk translation.
+
+4. Merge/application rule:
+
+- The service, not the UI, must parse the repair payload.
+- If schema/JSON output is supported, parse the repair fields directly from JSON.
+- If schema/JSON output is not supported, first try prompt-enforced JSON plus repair retries, and only then parse the deterministic marker fallback and normalize it into the same internal repair structure.
+- When a repair payload is present, the service must replace only the previously committed trailing fragment identified by the repair payload instead of appending duplicate text.
+- If the targeted previous fragment cannot be matched unambiguously, the service must fail the chunk safely and retry or surface a recoverable error rather than corrupt output.
+
+Deliverable: prompt behavior at sentence boundaries is specified as a service contract, not a loose prompt idea.
+
+### Phase 0.3 (required): define LLM-assisted error popup contract
+
+Add a formal decision path for translation-time errors:
+
+1. Error classification rule:
+
+- Introduce a service-level classifier that maps failures into categories such as:
+  - `transient_provider_error`
+  - `invalid_model_output`
+  - `prompt_fixable_output_error`
+  - `content_policy_or_refusal`
+  - `internal_code_error`
+- Only `prompt_fixable_output_error` and optionally `uncertain_mixed_error` may trigger LLM-assisted user guidance.
+
+2. Popup trigger rule:
+
+- Run the explanatory LLM call when a chunk translation fails and the classifier says the failure may be fixable by changing prompt instructions.
+- Do not show the LLM popup for clear internal/code failures, deterministic filesystem failures, or other cases where user prompt edits are not a credible fix.
+
+3. Explanatory LLM output rule:
+
+- The explanatory LLM should receive:
+  - the original error message
+  - a compact summary of the failed prompt mode
+  - a short excerpt of the malformed model output if safe to include
+  - the current base system prompt plus current user customization
+- It should return structured JSON if possible, with fields like:
+  - `user_explanation`
+  - `likely_cause`
+  - `suggest_prompt_patch`
+  - `confidence_can_be_fixed_with_prompt`
+- If schema mode is unavailable, use the same strategy as above:
+  - prompt-enforced strict JSON instructions
+  - parse
+  - repair retry
+  - deterministic text fallback only if absolutely necessary
+
+4. UI decision rule:
+
+- Show a popup only if `confidence_can_be_fixed_with_prompt` is true or uncertain.
+- The popup should let the user:
+  - approve the suggested prompt addition
+  - reject it and keep existing prompt behavior
+  - provide their own replacement text to append to system prompt customization
+- If the user approves or edits the prompt patch, persist it in translation-state JSON before retrying the failed chunk.
+
+5. Safety rule:
+
+- Never allow the explanatory LLM to silently change prompts without user confirmation.
+- Never route internal/code failures through the explanatory popup path.
+- Preserve the original error details for logs/diagnostics even if the user sees an LLM-generated explanation.
+
+Deliverable: user-facing LLM error guidance is constrained to prompt-fixable cases and cannot interfere with normal internal error handling.
+
 ### Phase 1: Introduce new abstractions without breaking old flow
 
 1. Add `src/ai_book_translator/infrastructure/llm/types.py`
@@ -334,7 +482,14 @@ If keeping monolithic output, add output offset/hash ledger to detect duplicate 
 
 - `OpenAIConfig`, `OllamaConfig`, union type
 
-5. Keep existing providers temporarily; adapt them to implement new client interface.
+5. Extend translation-run config/state models with persisted prompt customization:
+
+- `system_prompt_customization`
+- `translation_instruction`
+- `boundary_repair_marker`
+- any future per-run prompt flags needed for specialized workflows such as historical-language modernization
+
+6. Keep existing providers temporarily; adapt them to implement new client interface.
 
 Deliverable: old code still works, new interface available.
 
@@ -343,6 +498,7 @@ Deliverable: old code still works, new interface available.
 1. Add `src/ai_book_translator/services/llm_json_client.py`
 
 - one path for schema attempt + parse + repair
+- shared behavior for "schema if available, otherwise prompt-enforced JSON, then repair, then explicit fallback"
 
 2. Refactor `MetadataService` to use this helper.
 
@@ -365,10 +521,47 @@ Deliverable: Metadata flow becomes provider-agnostic.
 - Accept callbacks for progress/chunk events.
 - Keep persistence and resume rules identical first.
 - Implement checkpoint contract from Phase 0 as service-owned behavior.
+- Own prompt assembly for:
+  - base system prompt
+  - persisted system prompt customization
+  - persisted per-run translation instruction
+  - previous-tail context and interrupted-sentence hint
+  - repair marker instructions
+- Own error classification for:
+  - prompt-fixable output problems
+  - non-fixable internal failures
+  - user-visible retry suggestions
 
-2. Thin `ui/workers/translation_worker.py` to orchestration wrapper around service.
+2. Extend the translation response contract beyond plain chapter/translation text.
 
-3. Add translation output schema validator for `{"chapter": str, "translation": str}`.
+- Prefer a structured response shape that can carry:
+  - `chapter`
+  - `translation`
+  - optional `tail_status`
+  - optional `repair_previous_fragment`
+  - optional `repair_retranslation`
+- If the provider can enforce schema or reliable JSON output, request structured JSON directly.
+- If the provider cannot enforce schema, first try prompt-enforced JSON plus JSON-repair handling.
+- Only if reliable JSON is still not possible should the system fall back to the deterministic text-marker protocol.
+
+3. Thin `ui/workers/translation_worker.py` to orchestration wrapper around service.
+
+4. Add translation output schema validator that also covers repair blocks and tail-status metadata.
+
+5. Implement boundary-aware commit logic in the service:
+
+- append clean chunk output normally
+- if chunk tail is `possibly_truncated`, persist that status in checkpoint
+- if current chunk contains a repair instruction for the previous tail, parse it into a normalized repair object, rewrite only the targeted prior tail fragment, and then append current-chunk output
+- only after the repair/apply step succeeds, advance `next_chunk_index`
+
+6. Add LLM-assisted failure explanation flow:
+
+- after chunk failure, classify the error
+- if not prompt-fixable, surface the normal error path only
+- if prompt-fixable or uncertain, call a dedicated explanatory prompt through `LLMJsonClient`
+- return a structured popup payload to UI instead of directly mutating prompts
+- retry the failed chunk only after explicit user confirmation or user-edited prompt patch
 
 Deliverable: Business logic testable without Qt.
 
@@ -379,16 +572,29 @@ Deliverable: Business logic testable without Qt.
 - Build `LLMConfig` only.
 - Call `ProviderFactory.create(config)`.
 
-2. Decide one connection test path:
+2. Persist translation custom instructions in the same JSON family that already tracks translation metadata/state.
+
+- The user should be able to enter:
+  - additional system prompt customization
+  - per-run translation instruction
+- This must be saved before translation starts so resume never depends on re-entering the same instruction manually.
+
+3. Decide one connection test path:
 
 - either synchronous in UI or use `ConnectionWorker`.
 - Prefer `ConnectionWorker` to avoid UI blocking.
 
-3. Add `services/document_service.py` to centralize `raw_text` extraction.
+4. Add `services/document_service.py` to centralize `raw_text` extraction.
 
 - Replace duplicated extraction in AppWindow/MetadataWorker/TranslatePage.
 
-4. Replace `_doc_hash_from_text` with `compute_document_hash` everywhere.
+5. Replace `_doc_hash_from_text` with `compute_document_hash` everywhere.
+
+6. Add a popup flow for prompt-fixable translation errors.
+
+- Show the original failure in a normal error channel for logs/diagnostics.
+- Show the LLM-generated explanation popup only for classified prompt-fixable or uncertain cases.
+- Persist approved prompt additions into the same translation-state JSON used for resume.
 
 Deliverable: shared behavior in one place.
 
@@ -461,6 +667,8 @@ src/ai_book_translator/
 - loose extraction path
 - repair retry success/failure
 - schema-supported vs unsupported backends
+- prompt-enforced JSON without schema mode
+- fallback to marker protocol only after JSON parse/repair is exhausted
 
 3. `tests/test_translation_service.py`
 
@@ -471,6 +679,14 @@ src/ai_book_translator/
 - resume after transient API/network error
 - resume after refusal on chunk N, then successful retry
 - checkpoint schema backward compatibility (if versioned)
+- incomplete sentence at chunk end does not cause guessed completion
+- next chunk can continue an interrupted sentence using previous-tail context
+- repair marker replaces prior trailing fragment without duplicating text
+- ambiguous repair target fails safely
+- persisted custom translation instruction is restored on resume
+- prompt-fixable output error produces explanatory popup payload
+- internal/code error does not invoke explanatory LLM flow
+- approved prompt patch is persisted before chunk retry
 
 4. `tests/test_document_service.py`
 
@@ -490,6 +706,8 @@ src/ai_book_translator/
 2. Migrate one service at a time (metadata first, translation second).
 3. Do not combine architectural refactor with prompt rewrites in same PR.
 4. Introduce feature flags or compatibility adapters when replacing provider calls.
+5. Treat repair-marker application as data migration logic: one bug here can corrupt output, so it needs narrow, explicit tests before rollout.
+6. Treat LLM-assisted error explanation as advisory only; user approval is mandatory before any prompt mutation.
 
 ---
 
@@ -516,6 +734,9 @@ You can consider this refactor complete when:
 5. Document extraction is centralized and reused.
 6. Docs match runtime behavior.
 7. Translation resume is deterministic and interruption-safe, with tested checkpoint semantics.
+8. Prompt customization survives resume because it is persisted in state JSON.
+9. Chunk-boundary interrupted sentences and previous-tail repair are covered by tests and do not duplicate or corrupt output.
+10. Prompt-fixable translation errors can produce an LLM-generated explanation popup, but internal/code errors do not.
 
 ---
 

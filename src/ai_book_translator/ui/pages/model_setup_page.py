@@ -14,19 +14,22 @@ from PyQt5.QtWidgets import (
 )
 
 from ai_book_translator.config.settings import Settings
-from ai_book_translator.infrastructure.llm.openai_provider import (
-    OpenAIResponsesProvider,
+from ai_book_translator.domain.llm_config import (
+    LLMConfig,
+    OpenAIConfig,
+    OllamaConfig,
+    config_to_dict,
 )
-from ai_book_translator.infrastructure.llm.local_provider import LocalOllamaProvider
+from ai_book_translator.infrastructure.llm.provider_factory import create_client
+from ai_book_translator.infrastructure.llm.client import LLMClient
 from ai_book_translator.services.connection_service import ConnectionService
 
 from ..widgets.error_banner import ErrorBanner
 
 
 class ModelSetupPage(QWidget):
-    """
-    Step 0 — Model setup
-    """
+    """Model setup page. Builds an LLMConfig, creates a client via factory,
+    tests connection, and passes config + client forward."""
 
     def __init__(self, on_success: Callable[..., None]):
         super().__init__()
@@ -36,7 +39,7 @@ class ModelSetupPage(QWidget):
         root.setContentsMargins(22, 22, 22, 22)
         root.setSpacing(14)
 
-        title = QLabel("Step 0 — Model setup")
+        title = QLabel("Step 2 — Model setup")
         title.setStyleSheet("font-size: 22px; font-weight: 700;")
 
         self.banner = ErrorBanner()
@@ -77,6 +80,9 @@ class ModelSetupPage(QWidget):
 
         # Buttons
         btn_row = QHBoxLayout()
+        btn_back = QPushButton("Back")
+        btn_back.clicked.connect(self._handle_back)
+        btn_row.addWidget(btn_back)
         btn_row.addStretch(1)
         self.btn_continue = QPushButton("Continue")
         self.btn_continue.clicked.connect(self._handle_continue)
@@ -104,14 +110,20 @@ class ModelSetupPage(QWidget):
         root.addLayout(btn_row)
 
         self.setLayout(root)
+        self._on_back: Optional[Callable[[], None]] = None
         self._sync_visibility(self.provider_combo.currentText())
+
+    def set_on_back(self, callback: Callable[[], None]) -> None:
+        self._on_back = callback
+
+    def _handle_back(self) -> None:
+        if self._on_back:
+            self._on_back()
 
     def _sync_visibility(self, provider_name: str) -> None:
         is_openai = provider_name == "openai"
-
         self.openai_key.setEnabled(is_openai)
         self.openai_model.setEnabled(is_openai)
-
         self.ollama_base_url.setEnabled(not is_openai)
         self.ollama_model.setEnabled(not is_openai)
 
@@ -129,8 +141,6 @@ class ModelSetupPage(QWidget):
         override = self._parse_chunk_chars(self.chunk_chars.text())
         if override is None:
             return base
-
-        # Settings is frozen=True => construct a new instance with the override
         return Settings(
             upload_retries=base.upload_retries,
             json_repair_retries=base.json_repair_retries,
@@ -140,16 +150,34 @@ class ModelSetupPage(QWidget):
             max_chunk_summaries_for_summary_of_summaries=base.max_chunk_summaries_for_summary_of_summaries,
         )
 
+    def build_config(self) -> LLMConfig:
+        """Build LLMConfig from current UI fields."""
+        provider_name = self.provider_combo.currentText().strip()
+        if provider_name == "openai":
+            api_key = (self.openai_key.text() or "").strip() or os.getenv(
+                "OPENAI_API_KEY", ""
+            )
+            model = (self.openai_model.text() or "").strip() or "gpt-5-nano"
+            if not api_key:
+                raise ValueError(
+                    "OpenAI API key is missing. Enter it or set OPENAI_API_KEY."
+                )
+            return OpenAIConfig(api_key=api_key, model=model)
+        else:
+            base_url = (
+                self.ollama_base_url.text() or ""
+            ).strip() or "http://localhost:11434"
+            model = (self.ollama_model.text() or "").strip() or "llama3.1"
+            return OllamaConfig(base_url=base_url, model=model)
+
     def _handle_continue(self) -> None:
         self.banner.hide()
 
-        provider_name = self.provider_combo.currentText().strip()
         target_lang = (self.target_language.text() or "").strip()
         if not target_lang:
             self.banner.show_error("Please enter target language.")
             return
 
-        # Build settings (with optional override)
         try:
             settings = self._settings_with_optional_override()
         except Exception:
@@ -158,32 +186,12 @@ class ModelSetupPage(QWidget):
             )
             return
 
-        # Create provider
         try:
-            if provider_name == "openai":
-                api_key = (self.openai_key.text() or "").strip() or os.getenv(
-                    "OPENAI_API_KEY", ""
-                )
-                model = (self.openai_model.text() or "").strip() or "gpt-5-nano"
-                if not api_key:
-                    self.banner.show_error(
-                        "OpenAI API key is missing. Enter it or set OPENAI_API_KEY."
-                    )
-                    return
-                provider = OpenAIResponsesProvider(api_key=api_key, model=model)
-            else:
-                base_url = (
-                    self.ollama_base_url.text() or ""
-                ).strip() or "http://localhost:11434"
-                model = (self.ollama_model.text() or "").strip() or "llama3.1"
-                provider = LocalOllamaProvider(base_url=base_url, model=model)
-
-            # Test connection before continuing
-            ConnectionService(provider).test()
-
+            config = self.build_config()
+            client = create_client(config)
+            ConnectionService(client).test()
         except Exception as e:
             self.banner.show_error(str(e))
             return
 
-        # pass settings forward
-        self._on_success(provider, target_lang, settings)
+        self._on_success(client, target_lang, settings, config)

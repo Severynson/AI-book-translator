@@ -78,6 +78,16 @@ python src/ai_book_translator/main.py
 - **Pause & Resume** — Pause translation at any time and resume later without losing progress
 - **Progress Tracking** — Real-time progress indicator during metadata and translation phases
 
+## Planned Translation Continuity Features
+
+The following translation-resume features are planned but not yet implemented:
+
+- **Chunk Boundary Sentence Safety** — Chunking already prefers to split on natural boundaries before the configured size limit, walking backward to punctuation/newline/space boundaries when possible. Planned work extends this by making the model explicitly avoid "finishing" an incomplete last sentence and by making the next chunk translation aware that it may begin with a continuation of the previous sentence.
+- **Cross-Chunk Repair Signaling** — The model should be allowed to explicitly react to both cases: an obviously interrupted last sentence, and a previous-chunk tail that was translated badly and should be replaced. For models that support structured output, this should be returned as JSON. For models that do not expose a strict JSON API mode, the system should still instruct them to return JSON and try to recover it through parsing/repair before falling back to a deterministic text-marker format.
+- **Per-Translation Custom Instructions** — Each translation run should be able to store user-defined instructions in the translation-state JSON and inject them into every translation request. This is intended for non-standard workflows such as modernization, historical-language normalization, or other text-specific handling rules.
+- **Prompt Customization Persistence** — The translation-state JSON should preserve both system-prompt customization and per-run user instructions so interrupted translations can resume with exactly the same prompt behavior.
+- **LLM-Assisted Error Explanation for User-Fixable Cases** — If a translation error looks potentially fixable by adjusting the prompt, the application should be able to ask an LLM to explain the error in plain language and suggest an extra system-prompt addition the user may approve, reject, or replace with their own instruction. Clearly internal/code errors should continue to use normal error handling without an LLM popup.
+
 ---
 
 ## Project Structure

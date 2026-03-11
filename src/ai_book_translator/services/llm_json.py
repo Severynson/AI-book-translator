@@ -1,18 +1,31 @@
+"""Backward-compatible JSON generation helper.
+
+New code should use LLMJsonClient from services.llm_json_client instead.
+This module is kept so existing tests continue to work until migrated.
+"""
 from __future__ import annotations
+
 from typing import Any, Dict
 
-from ..infrastructure.llm.base import LLMProvider
+from ..infrastructure.llm.client import LLMClient
+from ..infrastructure.llm.types import LLMRequest
 from ..infrastructure.llm.json_parser import parse_json_strict, extract_json_object_loose
 from ..infrastructure.llm.exceptions import InvalidJSONError
 
+
 def chat_json_strict_with_repair(
-    provider: LLMProvider,
+    provider: LLMClient,
     system_prompt: str,
     user_prompt: str,
     repair_retries: int = 2,
-    **kwargs: Any
+    **kwargs: Any,
 ) -> Dict[str, Any]:
-    raw = provider.chat_text(system_prompt=system_prompt, user_prompt=user_prompt, **kwargs)
+    request = LLMRequest(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+    )
+    resp = provider.generate_text(request)
+    raw = resp.text
 
     try:
         return parse_json_strict(raw)
@@ -27,13 +40,15 @@ def chat_json_strict_with_repair(
     bad = raw
     last_err: Exception | None = None
     for _ in range(repair_retries):
-        fix_system = "Return STRICT JSON only. No extra text."
-        fix_user = (
-            "Rewrite the following into valid JSON matching the required schema. "
-            "Return only JSON.\n\n"
-            f"{bad}"
+        fix_request = LLMRequest(
+            system_prompt="Return STRICT JSON only. No extra text.",
+            user_prompt=(
+                "Rewrite the following into valid JSON matching the required schema. "
+                f"Return only JSON.\n\n{bad}"
+            ),
         )
-        bad = provider.chat_text(system_prompt=fix_system, user_prompt=fix_user, **kwargs)
+        resp = provider.generate_text(fix_request)
+        bad = resp.text
         try:
             return parse_json_strict(bad)
         except InvalidJSONError as e:

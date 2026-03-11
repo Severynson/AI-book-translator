@@ -13,10 +13,11 @@ from PyQt5.QtWidgets import (
     QFileDialog,
 )
 
-from ai_book_translator.infrastructure.io.read_document.base import ReadDocument
 from ai_book_translator.config.settings import Settings
 from ai_book_translator.domain.models import DocumentInput, MetadataResult
-from ai_book_translator.infrastructure.llm.base import LLMProvider
+from ai_book_translator.domain.translation_checkpoint import TranslationCheckpoint
+from ai_book_translator.infrastructure.llm.client import LLMClient
+from ai_book_translator.services.document_service import ensure_raw_text
 
 from ..widgets.error_banner import ErrorBanner
 from ..workers.translation_worker import TranslationWorker
@@ -33,7 +34,7 @@ class TranslatePage(QWidget):
         root.setContentsMargins(22, 22, 22, 22)
         root.setSpacing(14)
 
-        title = QLabel("Step 2 — Translation")
+        title = QLabel("Step 4 — Translation")
         title.setStyleSheet("font-size: 22px; font-weight: 700;")
 
         self.banner = ErrorBanner()
@@ -73,13 +74,14 @@ class TranslatePage(QWidget):
 
     def start(
         self,
-        provider: LLMProvider,
+        client: LLMClient,
         settings: Settings,
         document: DocumentInput,
         metadata_result: MetadataResult,
         target_language: str,
-        resume_state: Optional[Dict[str, Any]] = None,
+        resume_checkpoint: Optional[TranslationCheckpoint] = None,
         resume_state_path: Optional[str] = None,
+        llm_config_dict: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.banner.hide()
         self.progress.setValue(0)
@@ -90,7 +92,7 @@ class TranslatePage(QWidget):
         self.btn_pause.setText("Pause")
         self._paused = False
 
-        if provider is None:
+        if client is None:
             self.banner.show_error("Provider is not configured.")
             return
         if document is None:
@@ -100,23 +102,18 @@ class TranslatePage(QWidget):
             self.banner.show_error("No metadata available.")
             return
 
-        # Ensure raw_text exists (extract if needed)
+        # Ensure raw_text exists
         if document.raw_text is None and document.file_path:
             try:
-                raw = ReadDocument.from_path(document.file_path).read(
-                    document.file_path
-                )
-                document = DocumentInput(file_path=document.file_path, raw_text=raw)
+                document = ensure_raw_text(document)
             except Exception as e:
                 self.banner.show_error(f"Failed to extract text for translation: {e}")
                 return
 
-        # Decide output path:
-        # - if resuming: reuse output_txt_path from resume_state
-        # - else: ask user to choose it now
+        # Decide output path
         output_txt_path = None
-        if resume_state and isinstance(resume_state, dict):
-            output_txt_path = resume_state.get("output_txt_path")
+        if resume_checkpoint:
+            output_txt_path = resume_checkpoint.output_txt_path or None
 
         if not output_txt_path:
             meta = metadata_result.metadata or {}
@@ -143,14 +140,15 @@ class TranslatePage(QWidget):
             output_txt_path = path
 
         self._worker = TranslationWorker(
-            provider=provider,
+            client=client,
             settings=settings,
             document=document,
             metadata_result=metadata_result,
             target_language=target_language,
             output_txt_path=str(output_txt_path),
-            resume_state=resume_state,
+            resume_checkpoint=resume_checkpoint,
             resume_state_path=resume_state_path,
+            llm_config_dict=llm_config_dict,
         )
         self._worker.progressed.connect(self._on_progress)
         self._worker.chunk_done.connect(self._on_chunk_done)

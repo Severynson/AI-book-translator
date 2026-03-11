@@ -3,56 +3,56 @@ import pytest
 from ai_book_translator.services.metadata_service import MetadataService
 from ai_book_translator.config.settings import Settings
 from ai_book_translator.domain.models import DocumentInput
+from ai_book_translator.infrastructure.llm.types import (
+    LLMCapabilities,
+    LLMRequest,
+    LLMResponse,
+)
 from ai_book_translator.infrastructure.llm.exceptions import (
     UploadNotSupportedError,
+    UploadFailedError,
     TransientLLMError,
     DocumentReadError,
     InvalidJSONError,
 )
 
+import json
 
-class FakeProvider:
-    """
-    Provider stub with scripted behavior.
-    Set these attributes in tests to control responses.
-    """
 
-    def __init__(self):
-        self.chat_text_calls = []
-        self.chat_doc_calls = []
+class FakeClient:
+    """LLMClient stub with scripted behavior."""
 
-        self.doc_behaviors = []  # list of either dict result or exception
-        self.text_behaviors = []  # list of str results (for chunk summaries)
-        self.repair_behaviors = (
-            []
-        )  # list of dict results (for json repair / summary-of-summaries)
+    def __init__(
+        self,
+        *,
+        supports_upload: bool = True,
+        supports_schema: bool = True,
+    ):
+        self._caps = LLMCapabilities(
+            supports_file_upload=supports_upload,
+            supports_json_schema=supports_schema,
+        )
+        self.calls: list = []
+        self.responses: list = []  # list of str or Exception
+
+    def capabilities(self) -> LLMCapabilities:
+        return self._caps
 
     def test_connection(self) -> None:
-        return None
+        pass
 
-    def chat_text(self, system_prompt: str, user_prompt: str, **kwargs):
-        self.chat_text_calls.append((system_prompt, user_prompt, kwargs))
-        if not self.text_behaviors:
-            return ""
-        return self.text_behaviors.pop(0)
-
-    def chat_text_with_document(
-        self, system_prompt: str, user_prompt: str, file_path: str, **kwargs
-    ):
-        self.chat_doc_calls.append((system_prompt, user_prompt, file_path, kwargs))
-        if not self.doc_behaviors:
-            raise UploadNotSupportedError("no scripted upload result")
-        b = self.doc_behaviors.pop(0)
-        if isinstance(b, Exception):
-            raise b
-        # metadata_service expects raw string, then parse_json_strict will parse it;
-        # in tests we monkeypatch parse_json_strict so we can return dict directly or use str.
-        return b
+    def generate_text(self, request: LLMRequest) -> LLMResponse:
+        self.calls.append(request)
+        if not self.responses:
+            return LLMResponse(text="{}")
+        r = self.responses.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return LLMResponse(text=r)
 
 
 @pytest.fixture
 def settings():
-    # Build with overrides (works for frozen dataclasses)
     return Settings(
         upload_retries=2,
         json_repair_retries=1,
@@ -63,38 +63,22 @@ def settings():
     )
 
 
-def _stub_schema_helpers(monkeypatch):
-    # Make schema helpers no-ops for unit testing.
-    monkeypatch.setattr(
-        "ai_book_translator.services.metadata_service.validate_metadata_json",
-        lambda meta: None,
-    )
-    monkeypatch.setattr(
-        "ai_book_translator.services.metadata_service.normalize_not_provided",
-        lambda meta: meta,
-    )
+VALID_META = {
+    "author(s)": "A",
+    "title": "T",
+    "language": ["en"],
+    "summary": "S",
+    "chapters": {
+        "ch1": {"general": "g1", "detailed": "d1"}
+    },
+}
 
 
-def test_upload_success(monkeypatch, settings):
-    _stub_schema_helpers(monkeypatch)
-
-    provider = FakeProvider()
-    provider.doc_behaviors = ["RAW_JSON"] 
-    svc = MetadataService(provider, settings)
-
-    # provider returns "raw json string"; parse_json_strict -> dict
-    monkeypatch.setattr(
-        "ai_book_translator.services.metadata_service.parse_json_strict",
-        lambda raw: {
-            "author(s)": "A",
-            "title": "T",
-            "language": "en",
-            "summary": "S",
-            "chapters": {
-                "ch1": {"general": "g1", "detailed": "d1"}
-            },
-        },
-    )
+def test_upload_success(settings):
+    client = FakeClient()
+    # Schema attempt returns valid JSON
+    client.responses = [json.dumps(VALID_META)]
+    svc = MetadataService(client, settings)
 
     doc = DocumentInput(file_path="book.pdf", raw_text=None)
     res = svc.generate_metadata(doc, target_language="uk")
@@ -102,62 +86,40 @@ def test_upload_success(monkeypatch, settings):
     assert res.strategy_used == "upload"
     assert res.fallback_reason is None
     assert res.metadata["target_language"] == "uk"
-    assert provider.chat_doc_calls, "expected upload call"
+    assert len(client.calls) >= 1
+    # First call should have file_path set
+    assert client.calls[0].file_path == "book.pdf"
 
 
-def test_upload_not_supported_falls_back_to_chunked(monkeypatch, settings):
-    _stub_schema_helpers(monkeypatch)
+def test_upload_not_supported_falls_back_to_chunked(settings):
+    client = FakeClient(supports_upload=False)
 
-    provider = FakeProvider()
-    svc = MetadataService(provider, settings)
-
-    # Upload fails
-    provider.doc_behaviors = [UploadNotSupportedError("no upload")]
-
-    # Chunk summaries (3 max)
-    provider.text_behaviors = ["sum1", "sum2", "sum3"]
-
-    # summary-of-summaries JSON result
-    monkeypatch.setattr(
-        "ai_book_translator.services.metadata_service.chat_json_strict_with_repair",
-        lambda **kwargs: {
-            "author(s)": "A",
-            "title": "T",
-            "language": "en",
-            "summary": "S",
-            "chapters": {},
-        },
-    )
+    # Chunk summaries (plain text responses)
+    chunk_responses = ["sum1", "sum2", "sum3"]
+    # Summary-of-summaries returns valid JSON
+    sos_meta = {**VALID_META, "chapters": {}}
+    all_responses = chunk_responses + [json.dumps(sos_meta)]
+    client.responses = all_responses
 
     doc = DocumentInput(
         file_path="book.pdf", raw_text="This is a book text that will be chunked."
     )
+    res = svc = MetadataService(client, settings)
     res = svc.generate_metadata(doc, target_language="pl")
 
     assert res.strategy_used == "chunked"
-    assert "no upload" in (res.fallback_reason or "")
+    assert "does not support file upload" in (res.fallback_reason or "")
     assert res.metadata["target_language"] == "pl"
-    assert provider.chat_text_calls, "expected chunk summarization calls"
 
 
-def test_no_file_path_uses_chunked(monkeypatch, settings):
-    _stub_schema_helpers(monkeypatch)
+def test_no_file_path_uses_chunked(settings):
+    client = FakeClient()
 
-    provider = FakeProvider()
-    svc = MetadataService(provider, settings)
+    chunk_responses = ["sum1", "sum2", "sum3"]
+    sos_meta = {**VALID_META, "chapters": {}}
+    client.responses = chunk_responses + [json.dumps(sos_meta)]
 
-    provider.text_behaviors = ["sum1", "sum2", "sum3"]
-    monkeypatch.setattr(
-        "ai_book_translator.services.metadata_service.chat_json_strict_with_repair",
-        lambda **kwargs: {
-            "author(s)": "A",
-            "title": "T",
-            "language": "en",
-            "summary": "S",
-            "chapters": {},
-        },
-    )
-
+    svc = MetadataService(client, settings)
     doc = DocumentInput(file_path=None, raw_text="Some long book text here...")
     res = svc.generate_metadata(doc, target_language="de")
 
@@ -166,11 +128,9 @@ def test_no_file_path_uses_chunked(monkeypatch, settings):
     assert res.metadata["target_language"] == "de"
 
 
-def test_chunked_requires_raw_text(monkeypatch, settings):
-    _stub_schema_helpers(monkeypatch)
-
-    provider = FakeProvider()
-    svc = MetadataService(provider, settings)
+def test_chunked_requires_raw_text(settings):
+    client = FakeClient()
+    svc = MetadataService(client, settings)
 
     doc = DocumentInput(file_path=None, raw_text=None)
 
@@ -178,74 +138,34 @@ def test_chunked_requires_raw_text(monkeypatch, settings):
         svc.generate_metadata(doc, target_language="en")
 
 
-def test_upload_transient_retry_then_success(monkeypatch, settings):
-    _stub_schema_helpers(monkeypatch)
-
-    provider = FakeProvider()
-    svc = MetadataService(provider, settings)
-
-    # First call transient, second call succeeds
-    provider.doc_behaviors = [
+def test_upload_transient_retry_then_success(settings):
+    client = FakeClient()
+    # First call fails with transient, second succeeds
+    client.responses = [
         TransientLLMError("timeout"),
-        "RAW_JSON",
+        json.dumps(VALID_META),
     ]
 
-    monkeypatch.setattr(
-        "ai_book_translator.services.metadata_service.parse_json_strict",
-        lambda raw: {
-            "author(s)": "A",
-            "title": "T",
-            "language": "en",
-            "summary": "S",
-            "chapters": {},
-        },
-    )
-
+    svc = MetadataService(client, settings)
     doc = DocumentInput(file_path="book.pdf", raw_text="fallback text just in case")
     res = svc.generate_metadata(doc, target_language="uk")
 
     assert res.strategy_used == "upload"
-    assert len(provider.chat_doc_calls) == 2, "should retry once then succeed"
+    assert len(client.calls) == 2
     assert res.metadata["target_language"] == "uk"
 
 
-def test_upload_invalid_json_triggers_repair(monkeypatch, settings):
-    _stub_schema_helpers(monkeypatch)
+def test_upload_invalid_json_triggers_repair(settings):
+    client = FakeClient()
+    # Schema attempt returns invalid JSON, prompt attempt also invalid,
+    # repair loop should eventually produce valid JSON
+    client.responses = [
+        "NOT_JSON",     # schema attempt
+        "NOT_JSON",     # prompt-only attempt
+        json.dumps(VALID_META),  # repair attempt
+    ]
 
-    provider = FakeProvider()
-    svc = MetadataService(provider, settings)
-
-    # We need TWO responses:
-    # 1. The first call (structured output attempt) returns invalid JSON.
-    # 2. The code catches that exception and calls chat_text_with_document AGAIN (fallback prompt mode).
-    #    That second call also returns "NOT_JSON" (or whatever).
-    # 3. Then parse_json_strict fails again, and it calls chat_json_strict_with_repair.
-    provider.doc_behaviors = ["NOT_JSON", "NOT_JSON"]
-
-    def parse_fail(_raw):
-        raise InvalidJSONError("bad json")
-
-    monkeypatch.setattr(
-        "ai_book_translator.services.metadata_service.parse_json_strict", parse_fail
-    )
-
-    # Repair returns valid dict
-    monkeypatch.setattr(
-        "ai_book_translator.services.metadata_service.chat_json_strict_with_repair",
-        lambda **kwargs: {
-            "author(s)": "A",
-            "title": "T",
-            "language": "en",
-            "summary": "S",
-            "chapters": {
-                "Chapter 1": {
-                    "general": "The beginning.",
-                    "detailed": "A very detailed summary of the beginning."
-                }
-            },
-        },
-    )
-
+    svc = MetadataService(client, settings)
     doc = DocumentInput(file_path="book.pdf", raw_text="fallback text")
     res = svc.generate_metadata(doc, target_language="es")
 

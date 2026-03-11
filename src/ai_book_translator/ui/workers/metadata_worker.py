@@ -4,19 +4,12 @@ from PyQt5.QtCore import QThread, pyqtSignal
 
 from ai_book_translator.config.settings import Settings
 from ai_book_translator.domain.models import DocumentInput, MetadataResult
-from ai_book_translator.infrastructure.llm.base import LLMProvider
+from ai_book_translator.infrastructure.llm.client import LLMClient
 from ai_book_translator.services.metadata_service import MetadataService
+from ai_book_translator.services.document_service import ensure_raw_text, document_hash
 from ai_book_translator.infrastructure.persistence.metadata_cache import (
     save_metadata_cache,
 )
-from ai_book_translator.infrastructure.persistence.translation_state import (
-    compute_document_hash,
-)
-
-try:
-    from ai_book_translator.infrastructure.io.read_document.base import ReadDocument
-except Exception:
-    ReadDocument = None
 
 
 class MetadataWorker(QThread):
@@ -26,50 +19,39 @@ class MetadataWorker(QThread):
 
     def __init__(
         self,
-        provider: LLMProvider,
+        client: LLMClient,
         settings: Settings,
         document: DocumentInput,
         target_language: str,
         display_name: str = "",
     ):
         super().__init__()
-        self.provider = provider
-        self.settings = settings
-        self.document = document
-        self.target_language = target_language
-        self.display_name = display_name or "document"
+        self._client = client
+        self._settings = settings
+        self._document = document
+        self._target_language = target_language
+        self._display_name = display_name or "document"
 
     def run(self) -> None:
         try:
             self.progressed.emit(5, "Preparing document…")
 
-            doc = self.document
-            if doc.raw_text is None and doc.file_path and ReadDocument is not None:
-                try:
-                    txt = ReadDocument.from_path(
-                        doc.file_path,
-                        use_ocr=doc.use_ocr,
-                        ocr_languages=doc.ocr_languages,
-                    ).read(doc.file_path)
-                    doc = DocumentInput(
-                        file_path=doc.file_path,
-                        raw_text=txt,
-                        use_ocr=doc.use_ocr,
-                        ocr_languages=doc.ocr_languages,
-                    )
-                except Exception:
-                    doc = self.document
+            doc = self._document
+            try:
+                doc = ensure_raw_text(doc)
+            except Exception:
+                doc = self._document
 
             self.progressed.emit(
-                15, f"Generating metadata JSON for {self.display_name}…"
+                15, f"Generating metadata JSON for {self._display_name}…"
             )
 
-            svc = MetadataService(self.provider, self.settings)
+            svc = MetadataService(self._client, self._settings)
             res: MetadataResult = svc.generate_metadata(
-                doc, target_language=self.target_language
+                doc, target_language=self._target_language
             )
 
-            doc_hash = compute_document_hash(doc.raw_text or "")
+            doc_hash_val = document_hash(doc)
             title_hint = ""
             try:
                 t = (res.metadata or {}).get("title")
@@ -79,9 +61,9 @@ class MetadataWorker(QThread):
                 pass
 
             p = save_metadata_cache(
-                document_hash=doc_hash,
+                document_hash=doc_hash_val,
                 metadata=dict(res.metadata or {}),
-                target_language=self.target_language,
+                target_language=self._target_language,
                 title_hint=title_hint,
             )
             self.progressed.emit(95, f"Cached metadata: {p}")
