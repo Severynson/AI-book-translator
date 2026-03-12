@@ -43,6 +43,8 @@ class AppState:
     metadata_result: Optional[MetadataResult] = None
     resume_checkpoint: Optional[TranslationCheckpoint] = None
     resume_state_path: Optional[str] = None
+    system_prompt_customization: str = ""
+    translation_instruction: str = ""
 
 
 class AppWindow(QMainWindow):
@@ -121,6 +123,8 @@ class AppWindow(QMainWindow):
             resume_checkpoint=self.state.resume_checkpoint,
             resume_state_path=self.state.resume_state_path,
             llm_config_dict=llm_config_dict,
+            system_prompt_customization=self.state.system_prompt_customization,
+            translation_instruction=self.state.translation_instruction,
         )
 
     # ---- callbacks ----
@@ -133,11 +137,13 @@ class AppWindow(QMainWindow):
         2. Cached metadata exists → skip metadata, go to model setup
         3. Neither → fresh flow via model setup
         """
-        # Ensure raw_text for hashing
+        # Ensure raw_text for hashing and resume detection.
+        # If extraction fails here, it will be retried later by
+        # the metadata worker and translate page.
         try:
             doc = ensure_raw_text(doc)
         except Exception:
-            pass
+            pass  # upload-first path doesn't need raw_text yet
 
         self.state.document = doc
         self.state.resume_checkpoint = None
@@ -146,7 +152,10 @@ class AppWindow(QMainWindow):
 
         doc_hash: Optional[str] = None
         if doc.raw_text:
-            doc_hash = document_hash(doc)
+            try:
+                doc_hash = document_hash(doc)
+            except Exception:
+                pass
 
         # 1) Check for incomplete translation
         if doc_hash:
@@ -173,12 +182,15 @@ class AppWindow(QMainWindow):
         self._go_model_setup()
 
     def _on_model_ready(
-        self, client: LLMClient, target_language: str, settings: Settings, config: LLMConfig
+        self, client: LLMClient, target_language: str, settings: Settings, config: LLMConfig,
+        system_prompt_customization: str = "", translation_instruction: str = "",
     ) -> None:
         self.state.client = client
         self.state.llm_config = config
         self.state.target_language = target_language
         self.state.settings = settings
+        self.state.system_prompt_customization = system_prompt_customization
+        self.state.translation_instruction = translation_instruction
 
         # If we already have metadata (cached), skip to translation
         if self.state.metadata_result:
@@ -186,8 +198,11 @@ class AppWindow(QMainWindow):
         else:
             self._go_metadata()
 
-    def _on_metadata_ready(self, metadata_result: MetadataResult) -> None:
+    def _on_metadata_ready(self, metadata_result: MetadataResult, enriched_doc: DocumentInput = None) -> None:
         self.state.metadata_result = metadata_result
+        # Update document with raw_text populated by metadata worker
+        if enriched_doc is not None and enriched_doc.raw_text:
+            self.state.document = enriched_doc
         self._go_translate()
 
     # ---- resume logic ----
@@ -250,6 +265,8 @@ class AppWindow(QMainWindow):
         self.state.resume_checkpoint = checkpoint
         self.state.resume_state_path = str(state_path)
         self.state.target_language = checkpoint.target_language or self.state.target_language
+        self.state.system_prompt_customization = checkpoint.system_prompt_customization or ""
+        self.state.translation_instruction = checkpoint.translation_instruction or ""
 
         # Reconstruct settings from checkpoint
         if checkpoint.translation_chunk_chars:

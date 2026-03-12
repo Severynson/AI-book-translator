@@ -47,6 +47,26 @@ def validate_metadata_json(obj: Dict[str, Any]) -> None:
 
 
 def normalize_not_provided(obj: Dict[str, Any]) -> Dict[str, Any]:
+    # Fix common LLM mistake: "author" or "authors" instead of "author(s)"
+    for wrong_key in ("author", "authors"):
+        if wrong_key in obj and "author(s)" not in obj:
+            obj["author(s)"] = obj.pop(wrong_key)
+        elif wrong_key in obj:
+            obj.pop(wrong_key)
+
+    # Fix common LLM mistake: "languages" instead of "language"
+    if "languages" in obj and "language" not in obj:
+        obj["language"] = obj.pop("languages")
+    elif "languages" in obj:
+        obj.pop("languages")
+
+    # Strip any unexpected keys (LLMs sometimes add "error", "contributors",
+    # "notes", etc.).  Keep only REQUIRED_KEYS + "target_language".
+    allowed = set(REQUIRED_KEYS) | {"target_language"}
+    for k in list(obj.keys()):
+        if k not in allowed:
+            obj.pop(k)
+
     # Normalize missing / empty strings to "not provided"
     # (skip "language" — handled separately as an array)
     for k in REQUIRED_KEYS:
@@ -82,12 +102,35 @@ def normalize_not_provided(obj: Dict[str, Any]) -> Dict[str, Any]:
     elif a is None:
         obj["author(s)"] = "not provided"
 
-    # Normalize chapters: if model returned "not provided" string, convert to {}
+    # Normalize chapters: must be a dict with {name: {general, detailed}} structure
     ch = obj.get("chapters")
-    if isinstance(ch, str):
-        if ch.strip().lower() == "not provided":
-            obj["chapters"] = {}
-    elif ch is None:
+    if isinstance(ch, dict):
+        # Strip chapter entries that don't have the required structure;
+        # coerce string values to {general: value, detailed: value}
+        cleaned: Dict[str, Any] = {}
+        for ck, cv in ch.items():
+            if not isinstance(ck, str):
+                continue
+            if isinstance(cv, dict) and "general" in cv and "detailed" in cv:
+                cleaned[ck] = cv
+            elif isinstance(cv, str):
+                # LLM returned a flat string instead of {general, detailed}
+                cleaned[ck] = {"general": cv, "detailed": cv}
+        obj["chapters"] = cleaned
+    elif isinstance(ch, list):
+        # LLM returned an array of chapter objects — try to convert
+        converted: Dict[str, Any] = {}
+        for item in ch:
+            if isinstance(item, dict):
+                name = str(item.get("name") or item.get("title") or item.get("chapter") or "")
+                if name:
+                    gen = str(item.get("general", item.get("summary", "")))
+                    det = str(item.get("detailed", item.get("description", gen)))
+                    converted[name] = {"general": gen, "detailed": det}
+        obj["chapters"] = converted
+    elif isinstance(ch, str):
+        obj["chapters"] = {}
+    else:
         obj["chapters"] = {}
 
     return obj

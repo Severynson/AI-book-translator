@@ -14,7 +14,7 @@ from ai_book_translator.infrastructure.persistence.metadata_cache import (
 
 class MetadataWorker(QThread):
     progressed = pyqtSignal(int, str)  # pct, stage
-    succeeded = pyqtSignal(object)  # MetadataResult
+    succeeded = pyqtSignal(object, object)  # MetadataResult, DocumentInput (with raw_text)
     failed = pyqtSignal(str)
 
     def __init__(
@@ -37,10 +37,7 @@ class MetadataWorker(QThread):
             self.progressed.emit(5, "Preparing document…")
 
             doc = self._document
-            try:
-                doc = ensure_raw_text(doc)
-            except Exception:
-                doc = self._document
+            doc = ensure_raw_text(doc)
 
             self.progressed.emit(
                 15, f"Generating metadata JSON for {self._display_name}…"
@@ -69,7 +66,7 @@ class MetadataWorker(QThread):
             self.progressed.emit(95, f"Cached metadata: {p}")
 
             self.progressed.emit(100, "Done")
-            self.succeeded.emit(res)
+            self.succeeded.emit(res, doc)
 
         except Exception as e:
             self.failed.emit(str(e))

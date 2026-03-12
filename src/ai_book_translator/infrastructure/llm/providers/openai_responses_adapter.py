@@ -91,9 +91,12 @@ class OpenAIResponsesAdapter:
             resp = self._post_json(url, payload)
         except LLMError as e:
             msg = str(e).lower()
+            # Schema validation errors are NOT upload errors — let them propagate
+            if "json_schema" in msg or "response_format" in msg or "schema" in msg:
+                raise
             if any(
                 s in msg
-                for s in ["input_file", "file_id", "unsupported", "invalid",
+                for s in ["input_file", "file_id", "unsupported",
                           "cannot", "not allowed"]
             ):
                 raise UploadNotSupportedError(
@@ -168,7 +171,10 @@ class OpenAIResponsesAdapter:
 
             return r.json()
 
-        raise TransientLLMError(f"Timeout/Network failure calling {url}") from last_err
+        detail = f" Last error: {last_err}" if last_err else ""
+        raise TransientLLMError(
+            f"Failed after {max_attempts} attempts calling {url}.{detail}"
+        ) from last_err
 
     def _extract_output_text(self, resp: Dict[str, Any]) -> str:
         out_items = resp.get("output", []) or []

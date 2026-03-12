@@ -72,21 +72,16 @@ python src/ai_book_translator/main.py
 
 - **PDF/TXT Upload or Pasted Text** — Choose your input method
 - **OCR for Scanned PDFs** — Use Tesseract OCR with configurable language detection (e.g., Ukrainian + English)
-- **Automatic Metadata Extraction** — Title, author(s), language(s), summary, chapter list
-- **Chapter-Aware Translation** — Preserves chapter structure and detects chapter boundaries
+- **Automatic Metadata Extraction** — Title, author(s), language(s), summary, chapter list with general and detailed descriptions
+- **Chapter-Aware Translation** — Detects chapter boundaries with fuzzy matching (handles Roman/Arabic numerals, multilingual prefixes like Chapter/Rozdil/Kapitel)
 - **Secondary Language Preservation** — Phrases in secondary languages (Latin, English in Ukrainian texts, etc.) are NOT translated
-- **Pause & Resume** — Pause translation at any time and resume later without losing progress
+- **Chunk Boundary Repair** — Model detects incomplete sentences at chunk boundaries and can repair previous chunk's tail translation
+- **Pause & Resume** — Pause translation at any time and resume later without losing progress; LLM config, custom instructions, and chapter state are all preserved
+- **Per-Translation Custom Instructions** — System prompt customization and per-run translation instructions, persisted in checkpoint for resume
+- **LLM-Assisted Error Recovery** — Prompt-fixable translation errors trigger an LLM-generated explanation popup; user can approve, edit, or reject suggested fixes
+- **Field History** — Model setup fields (API keys, model names, languages, custom instructions) remember the last 5 unique values across sessions; stored locally in `state/field_history.json` (gitignored)
+- **Responsive UI** — All input fields respect window width, wrapping long text vertically instead of overflowing horizontally; the page is scrollable
 - **Progress Tracking** — Real-time progress indicator during metadata and translation phases
-
-## Planned Translation Continuity Features
-
-The following translation-resume features are planned but not yet implemented:
-
-- **Chunk Boundary Sentence Safety** — Chunking already prefers to split on natural boundaries before the configured size limit, walking backward to punctuation/newline/space boundaries when possible. Planned work extends this by making the model explicitly avoid "finishing" an incomplete last sentence and by making the next chunk translation aware that it may begin with a continuation of the previous sentence.
-- **Cross-Chunk Repair Signaling** — The model should be allowed to explicitly react to both cases: an obviously interrupted last sentence, and a previous-chunk tail that was translated badly and should be replaced. For models that support structured output, this should be returned as JSON. For models that do not expose a strict JSON API mode, the system should still instruct them to return JSON and try to recover it through parsing/repair before falling back to a deterministic text-marker format.
-- **Per-Translation Custom Instructions** — Each translation run should be able to store user-defined instructions in the translation-state JSON and inject them into every translation request. This is intended for non-standard workflows such as modernization, historical-language normalization, or other text-specific handling rules.
-- **Prompt Customization Persistence** — The translation-state JSON should preserve both system-prompt customization and per-run user instructions so interrupted translations can resume with exactly the same prompt behavior.
-- **LLM-Assisted Error Explanation for User-Fixable Cases** — If a translation error looks potentially fixable by adjusting the prompt, the application should be able to ask an LLM to explain the error in plain language and suggest an extra system-prompt addition the user may approve, reject, or replace with their own instruction. Clearly internal/code errors should continue to use normal error handling without an LLM popup.
 
 ---
 
@@ -100,7 +95,7 @@ ai-book-translator/
 └── src/
     └── ai_book_translator/
         ├── config/              # Settings and configuration
-        ├── domain/              # Data models and schemas
+        ├── domain/              # Data models, schemas, checkpoint, LLM config
         ├── infrastructure/      # LLM providers, document readers, persistence
         ├── services/            # Business logic (metadata, translation, prompts, chunking)
         ├── ui/                  # PyQt5 pages, workers, widgets

@@ -5,7 +5,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, Optional
 
 
-CHECKPOINT_SCHEMA_VERSION = 1
+CHECKPOINT_SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -23,6 +23,16 @@ class TranslationCheckpoint:
     output_txt_path: str = ""        # absolute path to output file
     metadata_path: str = ""          # absolute path to cached metadata JSON
     translation_chunk_chars: int = 30000
+    # Custom prompt customizations persisted for resume
+    system_prompt_customization: str = ""
+    translation_instruction: str = ""
+    # Boundary repair marker for non-JSON backends
+    boundary_repair_marker: str = "|||RETRANSLATE_PREVIOUS|||"
+    # Tail tracking for chunk boundary repair
+    last_committed_chunk_tail_translation: str = ""
+    last_committed_chunk_tail_status: str = "clean"  # clean | possibly_truncated | repaired
+    # Diagnostics
+    last_error: str = ""
     updated_at_unix: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
@@ -46,5 +56,11 @@ class TranslationCheckpoint:
             output_txt_path=str(d.get("output_txt_path", "")),
             metadata_path=str(d.get("metadata_path", "")),
             translation_chunk_chars=int(d.get("translation_chunk_chars", 30000)),
+            system_prompt_customization=str(d.get("system_prompt_customization", "")),
+            translation_instruction=str(d.get("translation_instruction", "")),
+            boundary_repair_marker=str(d.get("boundary_repair_marker", "|||RETRANSLATE_PREVIOUS|||")),
+            last_committed_chunk_tail_translation=str(d.get("last_committed_chunk_tail_translation", "")),
+            last_committed_chunk_tail_status=str(d.get("last_committed_chunk_tail_status", "clean")),
+            last_error=str(d.get("last_error", "")),
             updated_at_unix=int(d.get("updated_at_unix", 0)),
         )

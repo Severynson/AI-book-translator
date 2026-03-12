@@ -1,4 +1,7 @@
 from __future__ import annotations
+
+import re
+import unicodedata
 from typing import List, Any, Dict, Optional
 
 # =========================
@@ -9,12 +12,25 @@ METADATA_SYSTEM_PROMPT = (
     "Extract book metadata and return ONLY a single JSON object (no markdown, no extra text). "
     "The JSON must contain EXACTLY these keys and no others: "
     '"author(s)", "title", "language", "summary", "chapters". '
+    "\n\n"
+    "CRITICAL — KEY NAME RULES:\n"
+    'The author key MUST be spelled EXACTLY as "author(s)" — with parentheses around the s. '
+    'Do NOT use "author", "authors", or any other variation. The ONLY accepted key is "author(s)".\n'
+    'The language key MUST be spelled EXACTLY as "language" (singular). '
+    'Do NOT use "languages" or any other variation. The ONLY accepted key is "language".\n\n'
     'If a field is not present, use the EXACT string "not provided", '
     "EXCEPT for fields explicitly marked below as inferable or generatable. "
     '"author(s)" MUST be a single string of names separated by comma+space (", "), never an array. '
     '"chapters" MUST be a JSON object where each key is a chapter identifier string and each value is an object '
-    'with two keys: "general" (a short 1-3 sentence summary) and "detailed" (a detailed short essay summary); '
-    "if chapters cannot be inferred, output an empty object {}.\n\n"
+    'with exactly two keys: "general" and "detailed".\n\n'
+    "CHAPTER SUMMARY RULES (MANDATORY):\n"
+    '- "general": ONE compact orientation sentence (15-35 words). '
+    "What this chapter is broadly about — not a retelling, just orientation.\n"
+    '- "detailed": A clearly fuller summary (80-140 words, 3-6 sentences) with the main ideas, '
+    "conflicts, arguments, or events that matter for understanding and translating this chapter accurately.\n"
+    "- The two fields MUST NOT be paraphrases of each other.\n"
+    '- "detailed" MUST contain materially more information than "general".\n'
+    "- If chapters cannot be inferred, output an empty object {}.\n\n"
     "IMPORTANT — INFERENCE & GENERATION RULES:\n"
     '- "language": MUST be a JSON ARRAY of language name strings, ordered by frequency of occurrence '
     "in the text (most frequent first). The first element is the PRIMARY language of the document. "
@@ -44,16 +60,18 @@ METADATA_REPAIR_PROMPT = (
     '  • "summary"\n'
     '  • "chapters"\n\n'
     "KEY CONSTRAINTS:\n"
-    '- "author(s)":\n'
+    '- "author(s)" (EXACTLY this spelling — with parentheses around the s, NOT "author" or "authors"):\n'
     "  • MUST be a SINGLE STRING\n"
     '  • MUST list author names separated by comma + space (", ")\n'
     "  • MUST NOT be a JSON array\n"
+    '  • The key MUST be literally "author(s)" — any other spelling is INVALID\n'
     '  • If authors are unknown, use the EXACT string "not provided"\n\n'
     '- "title":\n'
     "  • MUST be a STRING\n"
     '  • If title is unknown, use the EXACT string "not provided"\n\n'
-    '- "language":\n'
+    '- "language" (EXACTLY this spelling — singular, NOT "languages"):\n'
     "  • MUST be a JSON ARRAY of strings\n"
+    "  • The key MUST be literally \"language\" — any other spelling is INVALID\n"
     "  • Languages must be ordered by frequency of occurrence (most frequent first)\n"
     "  • First element is the PRIMARY language of the document\n"
     "  • Additional elements are SECONDARY languages (used in titles, quotations, epigraphs, proper nouns)\n"
@@ -67,7 +85,13 @@ METADATA_REPAIR_PROMPT = (
     '- "chapters":\n'
     "  • MUST be a JSON OBJECT (dictionary)\n"
     "  • Each KEY must be a chapter identifier (string)\n"
-    '  • Each VALUE must be an OBJECT with exactly two keys: "general" (1-3 sentences) and "detailed" (short essay)\n'
+    '  • Each VALUE must be an OBJECT with exactly two keys: "general" and "detailed"\n'
+    '  • "general": ONE compact orientation sentence (15-35 words). '
+    "What this chapter is broadly about — not a retelling, just orientation.\n"
+    '  • "detailed": A clearly fuller summary (80-140 words, 3-6 sentences) with the main ideas, '
+    "conflicts, arguments, or events that matter for understanding and translating this chapter.\n"
+    '  • The two fields MUST NOT be paraphrases of each other. '
+    '"detailed" MUST contain materially more information than "general".\n'
     "  • MUST NOT be an array\n"
     "  • If chapters cannot be inferred, use an EMPTY OBJECT {}\n\n"
     "ADDITIONAL STRICT RULES:\n"
@@ -84,12 +108,12 @@ METADATA_REPAIR_PROMPT = (
     '  "summary": "This work explores the structure and dynamics of the unconscious mind, introducing foundational concepts of analytical psychology such as archetypes, the collective unconscious, and symbolic interpretation of mythological and psychological material.",\n'
     '  "chapters": {\n'
     '    "Chapter 1": {\n'
-    '      "general": "Introduction to the concept of the unconscious and its role in psychological life.",\n'
-    '      "detailed": "Jung introduces the concept of the unconscious not as a mere repository of repressed memories, but as a dynamic and creative force..."\n'
+    '      "general": "Introduces the concept of the unconscious as a dynamic psychological force beyond repression.",\n'
+    '      "detailed": "Jung opens by distinguishing his view of the unconscious from the Freudian model of mere repression. He argues the unconscious is a creative, autonomous system that produces symbols, dreams, and compensatory images. The chapter traces the historical development of the concept from philosophical speculation through clinical observation. Jung introduces the distinction between the personal unconscious (individual repressed content) and hints at a deeper collective layer. He uses case material to show how unconscious processes manifest in neurotic symptoms, slips, and spontaneous imagery, setting up the theoretical framework for the rest of the book."\n'
     "    },\n"
     '    "Chapter 2": {\n'
-    '      "general": "Analysis of mythological symbols and their psychological significance.",\n'
-    '      "detailed": "In this chapter, the author examines various myths from different cultures to demonstrate the universality of certain symbols..."\n'
+    '      "general": "Examines mythological symbols across cultures as evidence for universal psychological patterns.",\n'
+    '      "detailed": "Jung surveys myths from Greek, Egyptian, Hindu, and Norse traditions, identifying recurring motifs such as the hero journey, the great mother, the wise old man, and the shadow. He argues these parallels cannot be explained by cultural diffusion alone and must reflect innate psychological structures he terms archetypes. The chapter contrasts reductive interpretation (symbols as disguised wishes) with synthetic interpretation (symbols as expressions of developmental potential). Jung draws on ethnographic data and clinical dream analysis to demonstrate how modern patients spontaneously produce imagery that mirrors ancient mythological themes."\n'
     "    }\n"
     "  }\n"
     "}\n\n"
@@ -141,6 +165,94 @@ def build_summary_of_summaries_user_prompt(
 
 
 # =========================
+# CHAPTER MATCHING
+# =========================
+
+# Roman numeral mapping
+_ROMAN_MAP = {
+    "i": "1", "ii": "2", "iii": "3", "iv": "4", "v": "5",
+    "vi": "6", "vii": "7", "viii": "8", "ix": "9", "x": "10",
+    "xi": "11", "xii": "12", "xiii": "13", "xiv": "14", "xv": "15",
+    "xvi": "16", "xvii": "17", "xviii": "18", "xix": "19", "xx": "20",
+    "xxi": "21", "xxii": "22", "xxiii": "23", "xxiv": "24", "xxv": "25",
+    "xxvi": "26", "xxvii": "27", "xxviii": "28", "xxix": "29", "xxx": "30",
+}
+
+
+def _normalize_chapter_key(s: str) -> str:
+    """Normalize a chapter identifier for fuzzy comparison.
+
+    Handles: case, whitespace, punctuation, Roman↔Arabic numerals,
+    common prefixes in multiple languages (Chapter, Розділ, Kapitel, etc.).
+    """
+    s = unicodedata.normalize("NFKC", s)
+    s = s.lower().strip()
+    # Remove common punctuation (dots, colons, dashes, em-dashes)
+    s = re.sub(r"[.:;,\-–—]", " ", s)
+    # Remove common chapter prefixes in various languages
+    s = re.sub(
+        r"^(chapter|ch|розділ|частина|глава|раздел|chapitre|kapitel|capitulo|capitolo|deel)\b\.?\s*",
+        "",
+        s,
+    )
+    s = s.strip()
+    # Replace Roman numerals that stand alone
+    tokens = s.split()
+    normalized_tokens = []
+    for t in tokens:
+        arabic = _ROMAN_MAP.get(t)
+        if arabic is not None:
+            normalized_tokens.append(arabic)
+        else:
+            normalized_tokens.append(t)
+    s = " ".join(normalized_tokens)
+    # Collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def find_matching_chapter_key(
+    candidate: str,
+    known_keys: Dict[str, Any],
+) -> Optional[str]:
+    """Find the metadata chapter key that best matches a candidate chapter name.
+
+    Returns the original metadata key (not normalized) or None if no match.
+    """
+    if not candidate or not known_keys:
+        return None
+
+    candidate_stripped = candidate.strip()
+
+    # 1. Exact match
+    if candidate_stripped in known_keys:
+        return candidate_stripped
+
+    # 2. Case-insensitive exact
+    for key in known_keys:
+        if key.strip().lower() == candidate_stripped.lower():
+            return key
+
+    # 3. Normalized match (handles Roman↔Arabic, prefix removal, etc.)
+    norm_candidate = _normalize_chapter_key(candidate_stripped)
+    if not norm_candidate:
+        return None
+
+    for key in known_keys:
+        if _normalize_chapter_key(key) == norm_candidate:
+            return key
+
+    # 4. Numeric-only fallback: if normalization yields just a number, match on that
+    if norm_candidate.isdigit():
+        for key in known_keys:
+            norm_key = _normalize_chapter_key(key)
+            if norm_key == norm_candidate:
+                return key
+
+    return None
+
+
+# =========================
 # STEP 2 — TRANSLATION
 # =========================
 
@@ -148,6 +260,7 @@ def build_summary_of_summaries_user_prompt(
 def build_translation_system_prompt(
     previous_tail: str,
     source_languages: Optional[List[str]] = None,
+    system_prompt_customization: str = "",
 ) -> str:
     secondary_lang_rule = ""
     if source_languages and len(source_languages) > 1:
@@ -161,13 +274,34 @@ def build_translation_system_prompt(
             "- Only translate text written in the primary language.\n"
         )
 
+    customization_block = ""
+    if system_prompt_customization and system_prompt_customization.strip():
+        customization_block = (
+            "\nADDITIONAL INSTRUCTIONS FROM USER:\n"
+            f"{system_prompt_customization.strip()}\n"
+        )
+
     return (
         "You are a professional book translator.\n"
-        'Return STRICT JSON only: {"chapter": "...", "translation": "..."}.\n'
-        'The "chapter" field MUST match the exact chapter key from the "Chapters Context".\n'
-        "If you clearly detect the start of a NEW chapter in the chunk text, update the chapter.\n"
-        "Otherwise, keep the current chapter provided in the user prompt.\n"
-        "If unsure whether a new chapter starts, do NOT change the chapter.\n"
+        "Return STRICT JSON only with the following fields:\n"
+        '- "chapter": exact chapter key from context (update only if a new chapter clearly starts)\n'
+        '- "translation": the translated text for this chunk\n'
+        '- "tail_status": either "clean" or "possibly_truncated" (set to "possibly_truncated" '
+        "if the chunk ends in the middle of a sentence)\n"
+        '- "repair_previous_fragment": (OPTIONAL) if the previous chunk ended with a badly '
+        "translated fragment due to missing context, include the EXACT old translated trailing "
+        "fragment that should be removed from the already committed output\n"
+        '- "repair_retranslation": (OPTIONAL) the corrected translation for that fragment\n'
+        "\n"
+        "CHUNK BOUNDARY RULES:\n"
+        "- If the current chunk ends with an incomplete sentence, translate ONLY what is present. "
+        "Do NOT guess or complete the sentence beyond the available text.\n"
+        '- Set "tail_status" to "possibly_truncated" in that case.\n'
+        "- If the chunk starts by continuing an interrupted sentence from the previous chunk, "
+        "continue translating from the sentence continuation point seamlessly.\n"
+        "- If you can see that the previous chunk's ending was translated poorly because the "
+        "sentence was incomplete, provide the repair fields to fix it.\n"
+        "\n"
         "No markdown. No commentary.\n"
         "\n"
         "TRANSLATION OUTPUT RULES:\n"
@@ -181,6 +315,7 @@ def build_translation_system_prompt(
         "- Do NOT modify tabs that are clearly used for tables, code blocks, or aligned columns.\n"
         "- Do NOT intentionally add or remove paragraphs.\n"
         f"{secondary_lang_rule}"
+        f"{customization_block}"
         "\n\n"
         f"Tail of the previous chunk of source text (last 300 chars):\n{previous_tail}"
     )
@@ -191,6 +326,7 @@ def build_translation_user_prompt(
     target_language: str,
     current_chapter: Optional[str],
     context: Optional[Dict[str, Any]] = None,
+    translation_instruction: str = "",
 ) -> str:
     # 1) Build context block with dynamic chapter summaries
     context_parts = []
@@ -219,19 +355,17 @@ def build_translation_user_prompt(
         # Dynamic Chapter List
         chapters = context.get("chapters")
         if isinstance(chapters, dict) and chapters:
+            # Find which metadata key matches current_chapter (fuzzy)
+            matched_key: Optional[str] = None
+            if current_chapter:
+                matched_key = find_matching_chapter_key(current_chapter, chapters)
+
             chapter_lines = []
             for ch_id, ch_data in chapters.items():
                 if not isinstance(ch_data, dict):
                     continue
 
-                # Check if this is the current chapter
-                # Normalization: simple strip/lower check or direct match
-                is_current = False
-                if (
-                    current_chapter
-                    and str(ch_id).strip() == str(current_chapter).strip()
-                ):
-                    is_current = True
+                is_current = matched_key is not None and ch_id == matched_key
 
                 desc = ch_data.get("detailed" if is_current else "general")
                 if desc:
@@ -245,10 +379,18 @@ def build_translation_user_prompt(
     if context_parts:
         ctx_block = "Context:\n" + "\n".join(context_parts) + "\n\n"
 
+    instruction_block = ""
+    if translation_instruction and translation_instruction.strip():
+        instruction_block = (
+            f"\nSPECIAL TRANSLATION INSTRUCTION:\n"
+            f"{translation_instruction.strip()}\n\n"
+        )
+
     return (
         f"{ctx_block}"
         f"Target language: {target_language}\n"
         f"Current chapter (from previous chunk; keep unless a new chapter clearly starts): {current_chapter}\n\n"
+        f"{instruction_block}"
         "TASK:\n"
         "1) Translate ONLY the text inside <TEXT_TO_TRANSLATE> ... </TEXT_TO_TRANSLATE>.\n"
         "2) Do NOT translate any other parts of this prompt (Context, Target language line, etc.).\n"
@@ -257,4 +399,34 @@ def build_translation_user_prompt(
         f"{chunk_text}\n"
         "</TEXT_TO_TRANSLATE>\n\n"
         "Output JSON only."
+    )
+
+
+# =========================
+# ERROR EXPLANATION (LLM-assisted)
+# =========================
+
+ERROR_EXPLANATION_SYSTEM_PROMPT = (
+    "You are a translation system diagnostician. A translation chunk failed.\n"
+    "Analyze the error and return STRICT JSON only with these fields:\n"
+    '- "user_explanation": brief explanation for the user\n'
+    '- "likely_cause": technical cause\n'
+    '- "suggest_prompt_patch": suggested text to add to the system prompt to fix the issue (or empty string)\n'
+    '- "confidence_can_be_fixed_with_prompt": true or false\n'
+    "No markdown. No commentary. JSON only."
+)
+
+
+def build_error_explanation_prompt(
+    error_message: str,
+    malformed_output_excerpt: str,
+    current_system_prompt_summary: str,
+    current_user_customization: str,
+) -> str:
+    return (
+        f"ERROR: {error_message}\n\n"
+        f"Malformed model output (excerpt):\n{malformed_output_excerpt[:500]}\n\n"
+        f"Current system prompt mode: {current_system_prompt_summary}\n"
+        f"Current user customization: {current_user_customization or '(none)'}\n\n"
+        "Analyze and return JSON."
     )

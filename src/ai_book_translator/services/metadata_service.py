@@ -26,32 +26,13 @@ from .prompts import (
 from .chunking import chunk_by_chars
 
 
-METADATA_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["author(s)", "title", "language", "summary", "chapters"],
-    "properties": {
-        "author(s)": {"type": "string"},
-        "title": {"type": "string"},
-        "language": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
-        "summary": {"type": "string"},
-        "chapters": {
-            "type": "object",
-            "additionalProperties": {
-                "type": "object",
-                "properties": {
-                    "general": {"type": "string"},
-                    "detailed": {"type": "string"},
-                },
-                "required": ["general", "detailed"],
-                "additionalProperties": False,
-            },
-        },
-    },
-}
+# NOTE: OpenAI structured outputs require additionalProperties:false on ALL
+# objects and every property listed in 'required'.  The "chapters" field has
+# dynamic keys (chapter names unknown in advance), which is fundamentally
+# incompatible with that restriction.  We therefore rely on prompt-enforced
+# JSON only (no json_schema) for metadata generation.  The prompts already
+# produce correct output reliably.
+METADATA_SCHEMA = None
 
 
 class MetadataService:
@@ -144,6 +125,8 @@ class MetadataService:
         meta = self._json_client.generate_json(
             system_prompt=SUMMARY_OF_SUMMARIES_SYSTEM_PROMPT,
             user_prompt=build_summary_of_summaries_user_prompt(chunk_summaries),
+            json_schema=METADATA_SCHEMA,
+            max_tokens=2000,
         )
 
         meta = normalize_not_provided(meta)

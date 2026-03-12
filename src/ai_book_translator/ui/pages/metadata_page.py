@@ -22,13 +22,15 @@ from ..workers.metadata_worker import MetadataWorker
 
 class MetadataPage(QWidget):
     def __init__(
-        self, on_done: Callable[[MetadataResult], None], on_back: Callable[[], None]
+        self, on_done: Callable[[MetadataResult, Optional[DocumentInput]], None],
+        on_back: Callable[[], None],
     ):
         super().__init__()
         self._on_done = on_done
         self._on_back = on_back
         self._worker: Optional[MetadataWorker] = None
         self._last_result: Optional[MetadataResult] = None
+        self._enriched_doc: Optional[DocumentInput] = None
 
         root = QVBoxLayout()
         root.setContentsMargins(22, 22, 22, 22)
@@ -106,10 +108,11 @@ class MetadataPage(QWidget):
         self.progress.set_progress(pct)
         self.progress.set_stage(stage)
 
-    def _on_success(self, res: MetadataResult) -> None:
+    def _on_success(self, res: MetadataResult, enriched_doc: DocumentInput = None) -> None:
         import json
 
         self._last_result = res
+        self._enriched_doc = enriched_doc
         self.preview.setPlainText(
             json.dumps(res.metadata, ensure_ascii=False, indent=2)
         )
@@ -120,4 +123,4 @@ class MetadataPage(QWidget):
 
     def _continue(self) -> None:
         if self._last_result is not None:
-            self._on_done(self._last_result)
+            self._on_done(self._last_result, self._enriched_doc)

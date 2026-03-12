@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Optional, Dict, Any
 
 from PyQt5.QtWidgets import (
@@ -11,6 +12,8 @@ from PyQt5.QtWidgets import (
     QTextEdit,
     QProgressBar,
     QFileDialog,
+    QMessageBox,
+    QInputDialog,
 )
 
 from ai_book_translator.config.settings import Settings
@@ -48,7 +51,7 @@ class TranslatePage(QWidget):
 
         self.output_preview = QTextEdit()
         self.output_preview.setReadOnly(True)
-        self.output_preview.setPlaceholderText("Translation output will stream here…")
+        self.output_preview.setPlaceholderText("Translation output will stream here...")
 
         controls = QHBoxLayout()
 
@@ -82,6 +85,8 @@ class TranslatePage(QWidget):
         resume_checkpoint: Optional[TranslationCheckpoint] = None,
         resume_state_path: Optional[str] = None,
         llm_config_dict: Optional[Dict[str, Any]] = None,
+        system_prompt_customization: str = "",
+        translation_instruction: str = "",
     ) -> None:
         self.banner.hide()
         self.progress.setValue(0)
@@ -149,11 +154,14 @@ class TranslatePage(QWidget):
             resume_checkpoint=resume_checkpoint,
             resume_state_path=resume_state_path,
             llm_config_dict=llm_config_dict,
+            system_prompt_customization=system_prompt_customization,
+            translation_instruction=translation_instruction,
         )
         self._worker.progressed.connect(self._on_progress)
         self._worker.chunk_done.connect(self._on_chunk_done)
         self._worker.succeeded.connect(self._on_success)
         self._worker.failed.connect(self._on_fail)
+        self._worker.error_popup_requested.connect(self._on_error_popup)
         self._worker.start()
 
         self.btn_pause.setEnabled(True)
@@ -173,6 +181,57 @@ class TranslatePage(QWidget):
     def _on_fail(self, msg: str) -> None:
         self.banner.show_error(msg)
         self.btn_pause.setEnabled(False)
+
+    def _on_error_popup(self, payload_json: str) -> None:
+        """Handle LLM-assisted error popup from worker thread."""
+        try:
+            payload = json.loads(payload_json)
+        except Exception:
+            if self._worker:
+                self._worker.submit_popup_response("")
+            return
+
+        explanation = payload.get("user_explanation", "Unknown error")
+        likely_cause = payload.get("likely_cause", "")
+        suggested_patch = payload.get("suggest_prompt_patch", "")
+        confidence = payload.get("confidence_can_be_fixed_with_prompt", False)
+
+        detail_text = f"Error: {payload.get('original_error', '')}\n\n"
+        if likely_cause:
+            detail_text += f"Likely cause: {likely_cause}\n\n"
+        if suggested_patch:
+            detail_text += f"Suggested prompt addition:\n{suggested_patch}\n"
+
+        if confidence and suggested_patch:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Translation Error — Possible Fix")
+            msg.setText(explanation)
+            msg.setDetailedText(detail_text)
+            btn_approve = msg.addButton("Apply suggested fix", QMessageBox.AcceptRole)
+            btn_edit = msg.addButton("Edit fix", QMessageBox.ActionRole)
+            btn_reject = msg.addButton("Skip (abort chunk)", QMessageBox.RejectRole)
+            msg.exec_()
+
+            clicked = msg.clickedButton()
+            if clicked == btn_approve:
+                if self._worker:
+                    self._worker.submit_popup_response(suggested_patch)
+                return
+            elif clicked == btn_edit:
+                text, ok = QInputDialog.getMultiLineText(
+                    self,
+                    "Edit prompt patch",
+                    "Enter custom prompt addition:",
+                    suggested_patch,
+                )
+                if ok and text.strip():
+                    if self._worker:
+                        self._worker.submit_popup_response(text.strip())
+                    return
+
+        # Rejected or no fix available
+        if self._worker:
+            self._worker.submit_popup_response("")
 
     def _toggle_pause(self) -> None:
         if not self._worker:

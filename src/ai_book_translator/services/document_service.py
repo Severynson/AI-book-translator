@@ -36,4 +36,9 @@ def ensure_raw_text(doc: DocumentInput) -> DocumentInput:
 
 def document_hash(doc: DocumentInput) -> str:
     """Compute deterministic hash from document text."""
-    return compute_document_hash(doc.raw_text or "")
+    if not doc.raw_text:
+        raise RuntimeError(
+            "Cannot compute document hash: raw_text is empty. "
+            "Ensure text extraction ran successfully before hashing."
+        )
+    return compute_document_hash(doc.raw_text)

@@ -110,6 +110,9 @@ def test_upload_not_supported_falls_back_to_chunked(settings):
     assert res.strategy_used == "chunked"
     assert "does not support file upload" in (res.fallback_reason or "")
     assert res.metadata["target_language"] == "pl"
+    # METADATA_SCHEMA is None (dynamic chapter keys incompatible with structured
+    # outputs), so json_schema should NOT be sent
+    assert all(call.json_schema is None for call in client.calls)
 
 
 def test_no_file_path_uses_chunked(settings):
@@ -126,6 +129,8 @@ def test_no_file_path_uses_chunked(settings):
     assert res.strategy_used == "chunked"
     assert res.fallback_reason == "no file provided for upload"
     assert res.metadata["target_language"] == "de"
+    # No schema enforcement for metadata (dynamic chapter keys)
+    assert all(call.json_schema is None for call in client.calls)
 
 
 def test_chunked_requires_raw_text(settings):
@@ -157,10 +162,9 @@ def test_upload_transient_retry_then_success(settings):
 
 def test_upload_invalid_json_triggers_repair(settings):
     client = FakeClient()
-    # Schema attempt returns invalid JSON, prompt attempt also invalid,
-    # repair loop should eventually produce valid JSON
+    # No schema enforcement (METADATA_SCHEMA is None), so sequence is:
+    # prompt-only attempt returns invalid JSON, repair loop produces valid JSON
     client.responses = [
-        "NOT_JSON",     # schema attempt
         "NOT_JSON",     # prompt-only attempt
         json.dumps(VALID_META),  # repair attempt
     ]

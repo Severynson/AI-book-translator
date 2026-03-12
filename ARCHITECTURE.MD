@@ -6,316 +6,355 @@
 - **Remote LLM via OpenAI-compatible API (API key + model name)**, or
 - **Local LLM via an OpenAI-compatible endpoint (e.g., Ollama server URL + model name).**
 
-This is not a “thin wrapper”: it performs **book metadata extraction + chapter-aware translation**, provides **progress tracking**, and supports **pause/continue with resumable state**.
+This is not a "thin wrapper": it performs **book metadata extraction + chapter-aware translation**, provides **progress tracking**, supports **pause/continue with resumable state**, and handles **chunk boundary repair** for seamless translations.
 
 ---
 
 ## 2. High-level flow
 
-### Step 0 — Model connection setup (UI Page 1)
-User enters:
-- **API key** (placeholder example: `sk-proj-kn...`)
-- **Model name** (placeholder example: `gpt-5-nano`)
-- OR a **local endpoint reference** (e.g., Ollama OpenAI-compatible base URL) + model name
-
-App performs a **single check request**:
-- If success → proceed to upload page
-- If failure → stay on same page, show warning, ask to correct info
-
-### Step 1 — Book metadata extraction (LLM → JSON)
-User uploads a **PDF/TXT** or **pastes text** (UI Page 2), then app starts metadata generation (UI Page 3).
-
-The LLM is asked to return **JSON** with:
-- `"author(s)"`: extracted author name(s) OR `"not provided"`
-- `"title"`: extracted title OR `"not provided"`
-- `"language"`: detected language OR `"not provided"`
-- `"summary"`: 1-paragraph summary OR `"not provided"`
-- `"chapters"`: object where **keys are chapter identifiers** and **values are chapter summaries**
-  - If chapters cannot be detected → `"chapters": "not provided"` (or `{}` depending on strict schema choice)
-
-**Important rule:** if any field is missing in the document, the LLM must output `"not provided"` for that field.
-
-Then the app **adds** (client-side) the selected target language into the resulting structure:
-- `"target_language"`: value specified earlier in the UI
-
-**Context forwarding rule into Step 2:**
-- If at least one of `{author(s), title, current chapter description}` is available (not `"not provided"`), pass the available ones into Step 2 prompts.
-- If *all* are `"not provided"`/None, Step 2 must **receive no arguments** from the preprocessing step (i.e., omit those fields entirely from the prompt).
-
-### Step 2 — Chunk translation (1800 chars per chunk)
-App extracts full text and splits it into blocks of **~1800 characters** (≈1 page).
-
-For each chunk, app asks LLM to respond with **JSON only**:
-```json
-{
-  "chapter": "<chapter detected OR previous chapter carried over>",
-  "translation": "<translated text for this chunk>"
-}
-```
-
-**Chapter tracking rule (stateful):**
-- App stores a variable like `current_chapter`.
-- Prompt includes prior chunk’s chapter; LLM may keep it or overwrite it if a new chapter begins.
-- App updates `current_chapter` from the response after each chunk.
-
-**Translation continuity rule (short context):**
-- System prompt includes the **last 300 characters** of the **previous translation** so that translation style and context continue smoothly across chunks.
-
-**Secondary language preservation rule:**
-- If the metadata `"language"` array contains more than one element, the translation prompt instructs the LLM to **preserve secondary-language phrases as-is**.
-- Example: `"contra spem spero"` (Latin) should not be translated if Latin is a secondary language — the original author intentionally left it untranslated.
-- Only the primary language text is translated into the target language.
-
-**No extra text rule:**
-- LLM must output JSON only.
-- The `"translation"` field must contain only translated text, without disclaimers, introductions, or summaries.
-
----
-
-## 3. UI architecture (PyQt5 Pages)
-
-### Page 1 — Model Setup
-Inputs:
-- API key
-- model name
-- optionally base URL (for local endpoint)
-
-Behavior:
-- “Test connection” is automatically triggered when user proceeds
-- On success → open next page
-- On failure → stay, show warning banner
-
-### Page 2 — Book Input
-Options:
-- Upload PDF/TXT
-- Paste text
+### Step 1 — Book Input (UI Page 1)
+User uploads a **PDF/TXT** or **pastes text**.
 
 **OCR controls** (visible when "Upload PDF/TXT" is selected):
 - Checkbox: **"Use OCR (for scanned PDFs)"** — toggles between text extraction (default) and OCR
 - Text input: **OCR languages** — Tesseract language codes, primary first (e.g., `ukr+eng`)
 
-Behavior:
-- After input is provided → proceed to metadata generation page
+**Resume detection:**
+- If an incomplete translation checkpoint exists for this document (matched by content hash), a popup asks **"Continue"** or **"Start over"**.
+- **Continue**: skips model setup, restores saved LLM config + custom instructions, resumes from last committed chunk.
+- **Start over**: deletes old checkpoint, proceeds with fresh flow.
 
-### Page 3 — Metadata JSON Generation (Progress page)
-Shows:
-- progress indicator (spinner + stage text)
+### Step 2 — Model Setup (UI Page 2)
+User enters:
+- **Provider**: OpenAI or Ollama
+- **API key** (OpenAI) or **base URL** (Ollama) + **model name**
+- **Target language**
+- **Chunk size** (chars per translation chunk, default 30000)
+- **System prompt customization** (optional, persisted for resume)
+- **Translation instruction** (optional per-run instruction, persisted for resume)
 
-Remote/API LLM path:
-- send the full extracted text (or a reasonable excerpt if you later add limits) to Step 1 prompt → get JSON
+App performs a **connection test**:
+- If success → proceed
+- If failure → stay on same page, show warning
 
-Local LLM path (iterative approach):
-1) Chunk the book into pieces suitable for local context windows
-2) Ask for a **very short summary per chunk**
-   - For **one of the first few chunks**, explicitly ask it to:
-     - include title/author if present
-     - explicitly copy/provide the chapter list into the summary prompt
-3) Ask for a **“summary of summaries”** in the **Step 1 JSON format**
+### Step 3 — Book metadata extraction (LLM → JSON, UI Page 3)
+The LLM returns **JSON** with:
+- `"author(s)"`: extracted author name(s) OR `"not provided"`
+- `"title"`: extracted title OR `"not provided"`
+- `"language"`: array of detected languages, ordered by frequency (primary first)
+- `"summary"`: 1-paragraph summary OR `"not provided"`
+- `"chapters"`: object with `"general"` and `"detailed"` summaries per chapter
 
-On success:
-- proceed to translation page and start automatically
+Then the app **adds** (client-side):
+- `"target_language"`: value specified in Step 2
 
-### Page 4 — Translation Progress + Pause/Continue
-On entry:
-- translation starts automatically
+**Context forwarding into Step 4:**
+- Available metadata fields (title, author, chapter descriptions, language array) are passed to translation prompts.
 
-Displays:
-- percent progress: `translated_chunks / total_chunks * 100`
+### Step 4 — Chunk translation (UI Page 4)
+App extracts full text and splits into chunks (configurable size, default ~30000 chars).
 
-Controls:
-- **Pause**
-- **Continue**
+For each chunk, app asks LLM to respond with **JSON only**:
+```json
+{
+  "chapter": "<chapter detected OR previous chapter carried over>",
+  "translation": "<translated text for this chunk>",
+  "tail_status": "clean | possibly_truncated",
+  "repair_previous_fragment": "(optional) old trailing fragment to replace",
+  "repair_retranslation": "(optional) corrected translation for that fragment"
+}
+```
 
-When paused, app persists a resume state including:
-- list of all chunks (or a reference to stored chunks)
-- current chunk index
-- prompt prepared for the current chunk (pre-send)
-- previous chunk translation (needed for last-300 context rule)
-- current chapter being processed
+**Chapter tracking rule (stateful):**
+- App stores `current_chapter`, updated from each response.
+- The LLM is trusted to detect chapter transitions in the text.
+- When the LLM returns a chapter name, it is fuzzy-matched against metadata chapter keys using `find_matching_chapter_key()`. This handles: case differences, Roman vs Arabic numerals (e.g., "Chapter II" matches "Chapter 2"), and common chapter prefixes in multiple languages (Chapter, Rozdil, Kapitel, Chapitre, Glava, Capitolo, etc.).
+- If a match is found, the **metadata key** is used as `current_chapter` (so the next chunk's prompt loads the correct detailed description). If no match is found, the LLM's raw chapter name is used as-is.
+
+**Translation continuity rule (short context):**
+- System prompt includes the **last 300 characters** of the **previous source chunk** for context.
+
+**Chunk boundary rules:**
+- If the current chunk ends with an incomplete sentence, the model translates only what is present (no guessing). Sets `tail_status` to `"possibly_truncated"`.
+- Next chunk receives previous-tail context; model continues from the sentence continuation point.
+- If the model detects the previous chunk's ending was translated poorly, it can provide `repair_previous_fragment` (exact old text to remove) and `repair_retranslation` (corrected replacement). The service applies this repair before appending the current chunk.
+
+**Secondary language preservation rule:**
+- If the metadata `"language"` array contains more than one element, the translation prompt instructs the LLM to **preserve secondary-language phrases as-is**.
+- Example: `"contra spem spero"` (Latin) should not be translated if Latin is a secondary language.
+
+**Custom instructions:**
+- `system_prompt_customization`: appended to the system prompt for all chunks.
+- `translation_instruction`: included in the user prompt per chunk.
+- Both are persisted in the checkpoint for resume.
 
 ---
 
-## 4. Core components
+## 3. Layered architecture
 
-### 4.1 LLM Provider abstraction
-A unified interface so UI/business logic never cares whether it’s OpenAI-hosted or local.
+### 3.1 UI Layer
+- Collects user input and displays progress.
+- Starts workers, does not contain business logic.
+- Error popup for prompt-fixable translation failures (LLM-assisted guidance).
 
-**Capabilities:**
-- `test_connection()`
-- `chat_json(system_prompt, user_prompt) -> dict` (strict JSON parse + retries)
-- supports:
-  - OpenAI API key authentication
-  - configurable `base_url` for local endpoints (OpenAI-compatible)
+### 3.2 Application Services Layer
+- `ConnectionService`: tests LLM connectivity.
+- `MetadataService`: orchestrates metadata extraction (upload-first with chunked fallback).
+- `TranslationService`: owns complete translation workflow — chunking, prompt building, JSON parse/repair, boundary repair, checkpoint persistence, error classification.
+- `DocumentService`: centralized text extraction and hashing.
+- `LLMJsonClient`: unified JSON generation with schema-first → prompt-enforced → repair loop.
 
-### 4.2 Document ingestion
+### 3.3 LLM Core Layer
+- `LLMClient` (Protocol): provider-agnostic interface with `capabilities()`, `test_connection()`, `generate_text(request)`.
+- `LLMCapabilities`: declares `supports_file_upload` and `supports_json_schema`.
+- `LLMRequest` / `LLMResponse`: typed request/response models.
+- Services use `max_tokens` canonically; adapters translate to backend-specific fields.
+
+### 3.4 Provider Adapters Layer
+- `OpenAIResponsesAdapter`: uses `/v1/responses` (supports file upload + JSON schema).
+- `OllamaChatAdapter`: uses `/v1/chat/completions` (no upload, no schema).
+- Only place that knows endpoint shape and API dialect.
+
+---
+
+## 4. UI architecture (PyQt5 Pages)
+
+### Page 1 — Book Input
+- Upload PDF/TXT or paste text
+- OCR checkbox + language codes for scanned PDFs
+- Resume detection: popup if incomplete translation found
+
+### Page 2 — Model Setup
+- Provider selector (OpenAI / Ollama)
+- API key / base URL + model name
+- Target language, chunk size
+- System prompt customization (optional)
+- Translation instruction (optional)
+- Connection test on proceed
+
+### Page 3 — Metadata Generation (Progress)
+- Spinner + stage text
+- Remote: upload full text, get JSON
+- Local: chunk summaries → summary-of-summaries → JSON
+- On success → auto-proceed to translation
+
+### Page 4 — Translation Progress + Pause/Continue
+- Auto-starts translation
+- Progress bar + stage text
+- Streaming output preview
+- Pause / Continue controls
+- LLM-assisted error popup for prompt-fixable failures
+
+---
+
+## 5. Core components
+
+### 5.1 LLM Client Protocol
+```python
+class LLMClient(Protocol):
+    def capabilities(self) -> LLMCapabilities: ...
+    def test_connection(self) -> None: ...
+    def generate_text(self, request: LLMRequest) -> LLMResponse: ...
+```
+
+Provider construction: `create_client(config: LLMConfig) -> LLMClient` via factory.
+
+### 5.2 Document ingestion
 - **PDF text extraction** (PDF → text via `pypdf`)
 - **PDF OCR extraction** (PDF → images via `pdf2image` → text via `pytesseract`/Tesseract OCR)
 - TXT reading
-- direct pasted text
+- Direct pasted text
 
-**OCR mode** (user-selectable on Page 2):
+**OCR mode** (user-selectable on Page 1):
 - Uses **Tesseract OCR** with configurable language codes (e.g., `ukr+eng`)
-- Primary language listed first, secondary language(s) after `+`
-- Tesseract uses language priors, preferring the primary alphabet when selected
-- Requires system dependency: `tesseract` (e.g., `brew install tesseract` on macOS) and language data files
-- Requires system dependency: `poppler` (e.g., `brew install poppler` on macOS) for PDF-to-image conversion
+- Requires system dependencies: `tesseract` and `poppler`
 
-Output:
-- `raw_text: str`
+### 5.3 Chunking
+- Translation chunking: configurable character chunks (default 30000)
+- Local metadata chunking: smaller chunks tuned for local context windows (configurable)
 
-### 4.3 Chunking
-- Step 2 chunking: fixed-length character chunks of **1800**
-- Local metadata chunking: larger/smaller chunks tuned for local context window (configurable)
+### 5.4 Prompt building
+Two primary prompt families:
 
-### 4.4 Prompt building
-Two primary prompt “families”:
-
-#### Metadata prompt (Step 1)
-- input: full text (or local iterative flow’s summary-of-summaries input)
+#### Metadata prompt (Step 3)
+- input: full text (or local flow's summary-of-summaries)
 - output: strict JSON with required keys and `"not provided"` defaults
 
-#### Translation prompt (Step 2)
-- input: current chunk + optional metadata context (including language array) + current chapter + last-300 previous translation
-- output: strict JSON with `"chapter"` + `"translation"`
-- if secondary languages are detected in metadata, includes a rule to preserve them untranslated
+#### Translation prompt (Step 4)
+- input: current chunk + metadata context + current chapter + last-300 source tail + custom instructions
+- output: strict JSON with chapter, translation, tail_status, optional repair fields
+- secondary language preservation when detected in metadata
 
-### 4.5 State management (pause/resume)
-A serializable state object stored to disk (e.g., JSON file) containing:
-- `chunks[]`
-- `chunk_index`
-- `current_chapter`
-- `last_translation_tail_300`
-- `current_prompt`
-- `metadata_json`
+### 5.5 State management (checkpoint/resume)
+`TranslationCheckpoint` dataclass persisted as JSON:
+- `schema_version`: checkpoint format version (currently 2)
+- `document_hash`: content hash for identity
+- `document_path`: absolute path (empty for pasted text)
 - `target_language`
+- `llm_config`: serialized LLM provider config for reconstruction on resume
+- `next_chunk_index`: first chunk NOT yet committed
+- `chunks_total`
+- `current_chapter`
+- `previous_tail`: last 300 chars of source text
+- `output_txt_path`: absolute path to output file
+- `metadata_path`: absolute path to cached metadata JSON
+- `translation_chunk_chars`
+- `system_prompt_customization`: persisted custom system prompt additions
+- `translation_instruction`: persisted per-run translation instruction
+- `boundary_repair_marker`: deterministic fallback marker
+- `last_committed_chunk_tail_translation`: translated tail for boundary repair
+- `last_committed_chunk_tail_status`: `clean` | `possibly_truncated` | `repaired`
+- `last_error`: diagnostic snapshot
+- `updated_at_unix`
+
+**Checkpointing invariants:**
+- `next_chunk_index` always means "first chunk not yet committed"
+- Checkpoint writes are atomic (tmp + replace)
+- Crash-safe commit order: LLM call → validate → append output → flush → update checkpoint
+
+### 5.6 Error classification and LLM-assisted recovery
+Errors are classified into categories:
+- `transient_provider_error`: timeouts, rate limits, 5xx — retry recommended
+- `invalid_model_output`: unparseable response
+- `prompt_fixable_output_error`: may be fixable by changing prompt instructions
+- `content_policy_or_refusal`: model refused content
+- `internal_code_error`: non-recoverable internal failure
+
+For prompt-fixable errors:
+1. TranslationService calls an explanatory LLM prompt
+2. Returns structured payload: `user_explanation`, `likely_cause`, `suggest_prompt_patch`, `confidence_can_be_fixed_with_prompt`
+3. UI shows popup: user can approve, edit, or reject the suggested fix
+4. Approved patches are persisted in checkpoint before retry
+5. Internal/code errors bypass this flow entirely
 
 ---
 
-## 5. Data contracts (schemas)
+## 6. Data contracts (schemas)
 
-### 5.1 Metadata JSON schema (Step 1)
+### 6.1 Metadata JSON schema (Step 3)
 Required keys:
-- `author(s)` : string | array[string] | `"not provided"`
+- `author(s)` : string | `"not provided"`
 - `title` : string | `"not provided"`
-- `language` : array[string] | `["not provided"]` — **ordered by frequency** (primary language first, secondary languages after)
+- `language` : array[string] | `["not provided"]` — **ordered by frequency** (primary first)
 - `summary` : string | `"not provided"`
 - `chapters` : object<string, object> | `{}` — each value has `"general"` and `"detailed"` keys
-- `target_language` : string (added by the app after Step 1)
+- `target_language` : string (added by app)
 
 **Language array convention:**
-- First element = **primary language** (the language to translate FROM)
-- Subsequent elements = **secondary languages** (appear in titles, quotations, epigraphs, proper nouns — intentionally untranslated by the original author)
+- First element = **primary language** (translate FROM)
+- Subsequent elements = **secondary languages** (intentionally untranslated by original author)
 - Example: `["Ukrainian", "English", "Latin"]`
-- The LLM is instructed to infer this from the document text
 
-### 5.2 Translation JSON schema (Step 2)
+### 6.2 Translation JSON schema (Step 4)
 ```json
 {
   "chapter": "string",
-  "translation": "string"
+  "translation": "string",
+  "tail_status": "clean | possibly_truncated",
+  "repair_previous_fragment": "(optional) string",
+  "repair_retranslation": "(optional) string"
 }
 ```
 
 ---
 
-## 6. Error handling & robustness
+## 7. Error handling & robustness
 
 ### Connection errors
-- Page 1 must block navigation until `test_connection()` succeeds.
+- Page 2 blocks navigation until `test_connection()` succeeds.
 
 ### Non-JSON model responses
-- Strict parsing:
-  - attempt to parse
-  - if fails, auto-retry with a “Return valid JSON only” correction prompt (bounded retries)
-- If still failing, surface an error in UI with actionable guidance.
+- Strategy: schema-enforced (if supported) → prompt-enforced → strict parse → loose extraction → repair loop (bounded retries).
+- If still failing, classify error and optionally offer LLM-assisted popup.
 
 ### Rate limits / timeouts
-- Use retry with exponential backoff for remote APIs.
-- Allow pause/resume to avoid losing progress.
+- Retry with exponential backoff for remote APIs.
+- Pause/resume to avoid losing progress.
+
+### Chunk boundary errors
+- Repair protocol handles incomplete sentences at chunk boundaries.
+- No duplicate output: repair replaces targeted fragment, does not append.
+- Ambiguous repair target fails safely (skips repair).
 
 ### PDF extraction failures
 - Surface extraction error with suggestion to try TXT/paste.
 
 ---
 
-## 7. Concurrency model (PyQt5)
-Translation and metadata generation must run off the UI thread:
-- Worker thread (QThread/QRunnable) does:
-  - metadata generation
-  - chunk translation loop
-- UI receives signals:
-  - progress updates
-  - state updates (for pause/resume)
-  - completion/failure
+## 8. Concurrency model (PyQt5)
+Translation and metadata generation run off the UI thread:
+- Worker thread (QThread) calls service layer.
+- UI receives signals: progress, chunk_done, success, failure, error_popup.
+- Error popup uses mutex + wait condition to synchronize worker thread with UI dialog.
 
 ---
 
-## 8. Proposed project structure
+## 9. Project structure
 
 ```text
-ai-book-translator/
-  ARCHITECTURE.MD
-  README.md
-  pyproject.toml
-  .env.example
-
-  src/
-    ai_book_translator/
-      main.py
-
-      config/
-        settings.py
-
-      domain/
-        models.py
-        schemas.py
-
-      infrastructure/
-        llm/
-          base.py
-          openai_provider.py
-          local_provider.py
-          json_parser.py
-        io/
-          pdf_reader.py
-          ocr_pdf_reader.py
-          text_reader.py
-        persistence/
-          state_store.py
-          paths.py
-
-      services/
-        connection_service.py
-        metadata_service.py
-        translation_service.py
-        chunking.py
-        prompt_builders.py
-
-      ui/
-        app_window.py
-        pages/
-          model_setup_page.py
-          book_input_page.py
-          metadata_page.py
-          translate_page.py
-        widgets/
-          progress_widget.py
-          error_banner.py
-        workers/
-          metadata_worker.py
-          translation_worker.py
-
-  tests/
-    test_chunking.py
-    test_json_parsing.py
-    test_prompt_rules.py
+src/ai_book_translator/
+  main.py
+  config/
+    settings.py
+  domain/
+    llm_config.py          # OpenAIConfig, OllamaConfig, LLMConfig union
+    models.py              # DocumentInput, MetadataResult
+    schemas.py             # validate_metadata_json, normalize_not_provided
+    translation_checkpoint.py  # TranslationCheckpoint dataclass
+  infrastructure/
+    llm/
+      client.py            # LLMClient Protocol
+      types.py             # LLMCapabilities, LLMRequest, LLMResponse
+      provider_factory.py  # create_client(config) factory
+      exceptions.py        # Error classes + classify_error()
+      json_parser.py       # parse_json_strict, extract_json_object_loose
+      base.py              # backward-compat shim
+      providers/
+        openai_responses_adapter.py
+        ollama_chat_adapter.py
+      openai_provider.py   # legacy, still functional
+      local_provider.py    # legacy, still functional
+    io/
+      read_document/
+        base.py            # ReadDocument ABC + from_path factory
+        pdf_reader.py
+        ocr_pdf_reader.py  # Tesseract OCR via pytesseract + pdf2image
+        text_reader.py
+    persistence/
+      metadata_cache.py
+      translation_state.py
+  services/
+    connection_service.py
+    document_service.py    # ensure_raw_text, document_hash
+    llm_json_client.py     # LLMJsonClient (schema → prompt → repair)
+    metadata_service.py
+    translation_service.py # TranslationService + ErrorPopupPayload
+    chunking.py
+    prompts.py             # All prompt builders
+    llm_json.py            # backward-compat
+  ui/
+    app_window.py          # AppWindow + AppState + resume logic
+    pages/
+      book_input_page.py   # Page 1
+      model_setup_page.py  # Page 2 (+ custom instruction fields)
+      metadata_page.py     # Page 3
+      translate_page.py    # Page 4 (+ error popup handling)
+    widgets/
+      error_banner.py
+    workers/
+      metadata_worker.py
+      translation_worker.py  # Thin wrapper + error popup signal
 ```
 
 ---
 
-## 9. Key implementation notes
+## 10. Key implementation notes
 
-- **All LLM calls** must go through `LLMProvider`.
-- **Context rules** must be enforced by the prompt builder.
-- **Pause/resume** must serialize enough state to restart safely.
-- **Strict JSON** responses are mandatory; retries are required on violations.
+- **All LLM calls** go through the `LLMClient` protocol.
+- **Provider-specific details** are isolated in adapter classes — services never pass backend-specific kwargs.
+- **Capability detection** uses `client.capabilities()` — no exception-based control flow.
+- **Context rules** are enforced by the prompt builder.
+- **Pause/resume** serializes full state including LLM config and custom instructions.
+- **Strict JSON** responses are mandatory; schema → prompt → repair fallback chain.
+- **Boundary repair** prevents incomplete sentence artifacts without duplicating output.
+- **Error classification** routes prompt-fixable failures to LLM-assisted popup; internal errors bypass it.
